@@ -1,0 +1,16 @@
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger  Patch 1 Workflow
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${{ secrets.COLLABORATOR_PAT }}" \
+            https://api.github.com/repos/account-b-username/account-b-repo/dispatches \
+            -d '{"event_type": "account_a_updated"}'
+            
