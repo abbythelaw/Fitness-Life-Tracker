@@ -1,0 +1,19 @@
+name = "fitness-life-tracker"
+type = "javascript"
+account_id = ""
+workers_dev = true
+route = ""
+zone_id = ""
+
+[env.production]
+name = "fitness-life-tracker-prod"
+route = ""
+zone_id = ""
+
+[build]
+command = "npm install && npm run build"
+cwd = "./"
+watch_paths = ["src/**/*.jsx", "src/**/*.css"]
+
+[build.upload]
+format = "service-worker"
