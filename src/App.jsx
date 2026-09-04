@@ -259,12 +259,12 @@ const seedLogs = [
 ]
 
 const defaultMetricColors = [
-  { name: 'Cyan', value: '#38bdf8' },
-  { name: 'Pink', value: '#f472b6' },
-  { name: 'Emerald', value: '#34d399' },
-  { name: 'Orange', value: '#fb923c' },
-  { name: 'Purple', value: '#c084fc' },
-  { name: 'Blue', value: '#60a5fa' },
+  { name: 'Neon Cyan', value: '#00F0FF' },
+  { name: 'Hot Magenta', value: '#FF0055' },
+  { name: 'Neon Emerald', value: '#10B981' },
+  { name: 'Solar Amber', value: '#FFB800' },
+  { name: 'Electric Blue', value: '#2563EB' },
+  { name: 'Lime', value: '#00FF66' },
 ]
 
 const seedHealthMetrics = [
@@ -275,7 +275,7 @@ const seedHealthMetrics = [
     measurementType: 'numeric',
     unit: 'g',
     target: 120,
-    color: '#38bdf8',
+    color: '#00F0FF',
     entries: [
       { id: 'p1', date: formatDayKey(new Date(Date.now() - 86400000 * 9)), value: 98 },
       { id: 'p2', date: formatDayKey(new Date(Date.now() - 86400000 * 8)), value: 104 },
@@ -293,7 +293,7 @@ const seedHealthMetrics = [
     measurementType: 'numeric',
     unit: 'bpm',
     target: 65,
-    color: '#f472b6',
+    color: '#FF0055',
     entries: [
       { id: 'h1', date: formatDayKey(new Date(Date.now() - 86400000 * 8)), value: 68 },
       { id: 'h2', date: formatDayKey(new Date(Date.now() - 86400000 * 7)), value: 66 },
@@ -311,7 +311,7 @@ const seedHealthMetrics = [
     measurementType: 'boolean',
     unit: 'done',
     target: 1,
-    color: '#34d399',
+    color: '#10B981',
     entries: [
       { id: 'm1', date: formatDayKey(new Date(Date.now() - 86400000 * 9)), value: true },
       { id: 'm2', date: formatDayKey(new Date(Date.now() - 86400000 * 8)), value: false },
@@ -362,8 +362,57 @@ function App() {
   const [toast, setToast] = useState('')
   const [connectionError, setConnectionError] = useState('')
   const [currentTime, setCurrentTime] = useState(new Date())
+  const [bulkModalOpen, setBulkModalOpen] = useState(false)
 
   const user = session ? users[session] : null
+
+  // Lock body scroll whenever any modal/drawer overlay is present, so the
+  // page behind a popout can't drift while the popout itself stays fixed.
+  useEffect(() => {
+    const overlaySelector = '.modal-backdrop, .drawer-backdrop'
+    let locked = false
+    let scrollY = 0
+
+    const lock = () => {
+      if (locked) return
+      locked = true
+      scrollY = window.scrollY
+      const { style } = document.body
+      style.position = 'fixed'
+      style.top = `-${scrollY}px`
+      style.left = '0'
+      style.right = '0'
+      style.width = '100%'
+      style.overflow = 'hidden'
+    }
+
+    const unlock = () => {
+      if (!locked) return
+      locked = false
+      const { style } = document.body
+      style.position = ''
+      style.top = ''
+      style.left = ''
+      style.right = ''
+      style.width = ''
+      style.overflow = ''
+      window.scrollTo(0, scrollY)
+    }
+
+    const sync = () => {
+      if (document.querySelector(overlaySelector)) lock()
+      else unlock()
+    }
+
+    sync()
+    const observer = new MutationObserver(sync)
+    observer.observe(document.body, { childList: true, subtree: true })
+
+    return () => {
+      observer.disconnect()
+      unlock()
+    }
+  }, [])
 
   useEffect(() => {
     if (!supabase) return undefined
@@ -584,6 +633,10 @@ function App() {
             <button className="icon-button" aria-label="Notifications">
               <Bell size={18} />
             </button>
+            <button className="primary-button" onClick={() => setBulkModalOpen(true)}>
+              <NotebookPen size={16} />
+              Log day
+            </button>
             <button className="primary-button" onClick={() => setView('Grateful')}>
               <Sparkles size={16} />
               Gratitude note
@@ -601,6 +654,10 @@ function App() {
       </main>
 
       {toast && <div className="toast">{toast}</div>}
+
+      {bulkModalOpen && (
+        <BulkRecordModal user={user} updateUser={updateUser} setToast={setToast} onClose={() => setBulkModalOpen(false)} />
+      )}
     </div>
   )
 }
@@ -706,49 +763,269 @@ function Auth({ mode, setMode, onAuth, connectionError, supabaseEnabled }) {
   )
 }
 
-function Snapshot({ user, updateUser, setToast }) {
-  const [gaugeMode, setGaugeMode] = useState('Balance')
-  const defaultDashboardSnapshots = [
-    { id: 'activity', title: 'Activity / Steps', value: '19,840', suffix: 'Steps' },
-    { id: 'sleep', title: 'Sleep / Rest', value: '7h 45m', suffix: '' },
-    { id: 'heart', title: 'Heart / Vitals', value: '63', suffix: 'BPM' },
-    { id: 'wellness', title: 'Wellness Score', value: '87', suffix: 'Index' },
-    { id: 'focus', title: 'Focus Score', value: '73', suffix: 'Index' },
-    { id: 'stability', title: 'Speed / Stability', value: '50%', suffix: 'Live state' },
-  ]
-  const dashboardSnapshots = user.dashboardSnapshots || defaultDashboardSnapshots
-  const [dashboardEditor, setDashboardEditor] = useState(null)
-  const getDashboardSnapshot = (id) => dashboardSnapshots.find((snapshot) => snapshot.id === id)
-  const openDashboardEditor = (id) => setDashboardEditor({ ...getDashboardSnapshot(id) })
-  const saveDashboardSnapshot = () => {
-    if (!dashboardEditor?.title.trim()) return
-    updateUser({ dashboardSnapshots: dashboardSnapshots.map((snapshot) => snapshot.id === dashboardEditor.id ? { ...dashboardEditor, title: dashboardEditor.title.trim(), value: dashboardEditor.value.trim(), suffix: dashboardEditor.suffix.trim() } : snapshot) })
-    setDashboardEditor(null)
-    setToast('Snapshot updated')
+const getLastNDayKeys = (count, offsetDays = 0) => {
+  const today = new Date()
+  const days = []
+  for (let index = 0; index < count; index += 1) {
+    days.push(formatDayKey(new Date(today.getTime() - (index + offsetDays) * 86400000)))
   }
-  const deleteDashboardSnapshot = (id) => {
-    const snapshot = getDashboardSnapshot(id)
-    updateUser({ dashboardSnapshots: dashboardSnapshots.filter((item) => item.id !== id) })
-    setToast(`${snapshot?.title || 'Snapshot'} deleted`)
+  return days
+}
+
+const average = (values) => (values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null)
+
+function FocusForToday({ metrics, habits }) {
+  const sleepMetric = metrics.find((metric) => /sleep/i.test(metric.name) || /sleep/i.test(metric.category || ''))
+
+  const sleepInsight = (() => {
+    if (!sleepMetric) {
+      return {
+        tone: 'neutral',
+        title: 'Add a Sleep metric to unlock recovery insights',
+        detail: 'Log nightly sleep hours or score as a custom metric so we can track your 7-day trend.',
+      }
+    }
+    const entryByDay = new Map((sleepMetric.entries || []).map((entry) => [formatDayKey(entry.date), Number(entry.value) || 0]))
+    const recentDays = getLastNDayKeys(7, 0)
+    const priorDays = getLastNDayKeys(7, 7)
+    const recentValues = recentDays.map((day) => entryByDay.get(day)).filter((value) => value !== undefined)
+    const priorValues = priorDays.map((day) => entryByDay.get(day)).filter((value) => value !== undefined)
+    const recentAvg = average(recentValues)
+    const priorAvg = average(priorValues)
+
+    if (recentAvg === null) {
+      return {
+        tone: 'neutral',
+        title: `No ${sleepMetric.name.toLowerCase()} logged this week`,
+        detail: 'Log a value for the last 7 days to see your recovery trend here.',
+      }
+    }
+
+    if (priorAvg === null || priorAvg === 0) {
+      return {
+        tone: 'good',
+        title: `${sleepMetric.name} averaging ${recentAvg.toFixed(1)} ${sleepMetric.unit || ''}`.trim(),
+        detail: 'Keep logging daily so we can compare week-over-week trends.',
+      }
+    }
+
+    const pctChange = Math.round(((recentAvg - priorAvg) / priorAvg) * 100)
+    if (pctChange <= -10) {
+      return {
+        tone: 'alert',
+        title: `Sleep score dropped ${Math.abs(pctChange)}% this week`,
+        detail: 'Prioritize recovery today — earlier bedtime, hydration, and a lighter training load.',
+      }
+    }
+    if (pctChange >= 10) {
+      return {
+        tone: 'good',
+        title: `Sleep score improved ${pctChange}% this week`,
+        detail: 'Recovery is trending up — a great day to push intensity if you feel ready.',
+      }
+    }
+    return {
+      tone: 'neutral',
+      title: `Sleep score steady at ${recentAvg.toFixed(1)} ${sleepMetric.unit || ''}`.trim(),
+      detail: 'No major shift this week — maintain your current recovery routine.',
+    }
+  })()
+
+  const habitInsight = (() => {
+    if (!habits.length) {
+      return {
+        tone: 'neutral',
+        title: 'No habits set up yet',
+        detail: 'Add a habit to start tracking your daily completion rate.',
+      }
+    }
+    const todayKey = todayValue()
+    const activeToday = habits.filter((habit) => !(habit.restDay && new Date().getDay() === 0))
+    const doneToday = activeToday.filter((habit) => (habit.logs || []).some((entry) => entry.date === todayKey && entry.done)).length
+    const todayRate = activeToday.length ? Math.round((doneToday / activeToday.length) * 100) : 0
+
+    const historicalDays = getLastNDayKeys(30, 1)
+    const historicalRates = historicalDays.map((day) => {
+      const dayActive = habits.filter((habit) => !(habit.restDay && new Date(day).getDay() === 0))
+      if (!dayActive.length) return null
+      const dayDone = dayActive.filter((habit) => (habit.logs || []).some((entry) => entry.date === day && entry.done)).length
+      return (dayDone / dayActive.length) * 100
+    }).filter((value) => value !== null)
+    const historicalAvg = average(historicalRates)
+
+    if (historicalAvg === null) {
+      return {
+        tone: 'neutral',
+        title: `${doneToday}/${activeToday.length} habits completed today (${todayRate}%)`,
+        detail: 'Keep logging daily to build a historical average for comparison.',
+      }
+    }
+
+    const delta = Math.round(todayRate - historicalAvg)
+    if (delta <= -15) {
+      return {
+        tone: 'alert',
+        title: `Habit completion is ${Math.abs(delta)}% below your average today`,
+        detail: `You're at ${todayRate}% vs a ${Math.round(historicalAvg)}% 30-day average — knock out one more habit to catch up.`,
+      }
+    }
+    if (delta >= 15) {
+      return {
+        tone: 'good',
+        title: `Habit completion is ${delta}% above your average today`,
+        detail: `${todayRate}% completed vs your usual ${Math.round(historicalAvg)}% — great consistency.`,
+      }
+    }
+    return {
+      tone: 'neutral',
+      title: `${doneToday}/${activeToday.length} habits completed today (${todayRate}%)`,
+      detail: `In line with your ${Math.round(historicalAvg)}% 30-day average.`,
+    }
+  })()
+
+  return (
+    <section className="focus-today-panel">
+      <div className="focus-today-heading">
+        <h2>Focus for today</h2>
+        <p>Recommendations pulled from your logged history.</p>
+      </div>
+      <div className="focus-today-grid">
+        <article className={`focus-today-card tone-${sleepInsight.tone}`}>
+          <span className="focus-today-label">Sleep quality</span>
+          <strong>{sleepInsight.title}</strong>
+          <p>{sleepInsight.detail}</p>
+        </article>
+        <article className={`focus-today-card tone-${habitInsight.tone}`}>
+          <span className="focus-today-label">Habit completion</span>
+          <strong>{habitInsight.title}</strong>
+          <p>{habitInsight.detail}</p>
+        </article>
+      </div>
+    </section>
+  )
+}
+
+function BulkRecordModal({ user, updateUser, setToast, onClose }) {
+  const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
+  const habits = user.habits || []
+  const [dateKey, setDateKey] = useState(todayValue())
+  const [metricValues, setMetricValues] = useState({})
+  const [habitValues, setHabitValues] = useState({})
+
+  const setMetricValue = (metricId, value) => setMetricValues((current) => ({ ...current, [metricId]: value }))
+  const setHabitValue = (habitId, value) => setHabitValues((current) => ({ ...current, [habitId]: value }))
+
+  const handleSave = () => {
+    let touched = 0
+
+    const nextMetrics = metrics.map((metric) => {
+      const raw = metricValues[metric.id]
+      if (raw === undefined || raw === '' || raw === false) return metric
+      touched += 1
+      const value = metric.measurementType === 'boolean' ? true : Number(raw)
+      const entries = (metric.entries || []).filter((entry) => formatDayKey(entry.date) !== dateKey)
+      return { ...metric, entries: [...entries, { id: uid(), date: dateKey, value }] }
+    })
+
+    const nextHabits = habits.map((habit) => {
+      const raw = habitValues[habit.id]
+      if (raw === undefined || raw === '' || raw === false) return habit
+      touched += 1
+      const trackingType = habit.trackingType || (habit.measurementMode === 'binary' ? 'boolean' : 'numeric')
+      const value = trackingType === 'boolean' ? true : raw
+      const target = Number(habit.targetValue ?? habit.target) || 1
+      const done = trackingType === 'boolean' || trackingType === 'time' ? true : Number(value) >= target
+      const logs = (habit.logs || []).filter((entry) => entry.date !== dateKey)
+      return { ...habit, logs: [...logs, { id: uid(), date: dateKey, done, value }] }
+    })
+
+    if (!touched) {
+      setToast('Add at least one value before saving.')
+      return
+    }
+
+    updateUser({ healthMetrics: nextMetrics, habits: nextHabits })
+    setToast(`Logged ${touched} ${touched === 1 ? 'entry' : 'entries'} for ${dateKey}`)
+    onClose()
   }
-  const dashboardActions = (id) => (
-    getDashboardSnapshot(id) &&
-    <div className="dashboard-card-actions">
-      <button type="button" onClick={() => openDashboardEditor(id)}>Edit Snapshot</button>
-      <button type="button" onClick={() => deleteDashboardSnapshot(id)}>Delete</button>
+
+  return (
+    <div className="modal-backdrop metric-modal-backdrop" onClick={onClose}>
+      <div className="metric-modal-card" onClick={(event) => event.stopPropagation()}>
+        <div className="metric-modal-header">
+          <div>
+            <p className="eyebrow">BULK RECORD</p>
+            <h3>Log your day</h3>
+          </div>
+          <button className="icon-button subtle" onClick={onClose} aria-label="Close bulk record form">
+            <X size={15} />
+          </button>
+        </div>
+
+        <label className="field-label">
+          Date
+          <input type="date" value={dateKey} max={todayValue()} onChange={(event) => setDateKey(event.target.value)} />
+        </label>
+
+        <div className="metric-form-grid">
+          {metrics.map((metric) => (
+            <label key={metric.id} className="field-label">
+              {metric.name} {metric.unit ? `(${metric.unit})` : ''}
+              {metric.measurementType === 'boolean' ? (
+                <div className="checkbox-row">
+                  <input type="checkbox" checked={!!metricValues[metric.id]} onChange={(event) => setMetricValue(metric.id, event.target.checked)} />
+                  <span>Mark completed</span>
+                </div>
+              ) : (
+                <input
+                  type="number"
+                  value={metricValues[metric.id] ?? ''}
+                  placeholder={metric.measurementType === 'scale' ? '0-10' : metric.target ? `Target ${metric.target}` : 'Value'}
+                  onChange={(event) => setMetricValue(metric.id, event.target.value)}
+                />
+              )}
+            </label>
+          ))}
+
+          {habits.map((habit) => {
+            const trackingType = habit.trackingType || (habit.measurementMode === 'binary' ? 'boolean' : 'numeric')
+            return (
+              <label key={habit.id} className="field-label">
+                {habit.icon} {habit.name} {habit.unit && trackingType !== 'boolean' ? `(${habit.unit})` : ''}
+                {trackingType === 'boolean' ? (
+                  <div className="checkbox-row">
+                    <input type="checkbox" checked={!!habitValues[habit.id]} onChange={(event) => setHabitValue(habit.id, event.target.checked)} />
+                    <span>Mark done</span>
+                  </div>
+                ) : (
+                  <input
+                    type={trackingType === 'time' ? 'time' : 'number'}
+                    value={habitValues[habit.id] ?? ''}
+                    placeholder={habit.target ? `Target ${habit.target}` : 'Value'}
+                    onChange={(event) => setHabitValue(habit.id, event.target.value)}
+                  />
+                )}
+              </label>
+            )
+          })}
+        </div>
+
+        <div className="routine-actions-row">
+          <button className="secondary-button" onClick={onClose}>
+            <X size={15} />
+            Cancel
+          </button>
+          <button className="primary-button" onClick={handleSave}>
+            <Save size={15} />
+            Save all entries
+          </button>
+        </div>
+      </div>
     </div>
   )
+}
 
-  const trendData = [
-    { day: 'Mon', habits: 60, sleep: 7 },
-    { day: 'Tue', habits: 70, sleep: 8 },
-    { day: 'Wed', habits: 65, sleep: 6 },
-    { day: 'Thu', habits: 80, sleep: 8 },
-    { day: 'Fri', habits: 85, sleep: 7 },
-    { day: 'Sat', habits: 75, sleep: 8 },
-    { day: 'Sun', habits: 90, sleep: 9 },
-  ]
-
+function Snapshot({ user, updateUser, setToast }) {
   const defaultMetricCategories = ['Heart', 'Mobility', 'General Wellbeing', 'Sleep', 'Mood', 'Exercise Related', 'Overall Health', 'Uncategorized']
   const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
   const [metricModalOpen, setMetricModalOpen] = useState(false)
@@ -760,7 +1037,7 @@ function Snapshot({ user, updateUser, setToast }) {
     measurementType: 'numeric',
     unit: '',
     target: '',
-    color: '#38bdf8',
+    color: '#00F0FF',
     chartType: 'line',
     customCategory: '',
   })
@@ -782,7 +1059,7 @@ function Snapshot({ user, updateUser, setToast }) {
       measurementType: 'numeric',
       unit: '',
       target: '',
-      color: '#38bdf8',
+      color: '#00F0FF',
       chartType: 'line',
       customCategory: '',
     })
@@ -896,7 +1173,7 @@ function Snapshot({ user, updateUser, setToast }) {
       measurementType: metricForm.measurementType,
       unit: metricForm.measurementType === 'boolean' ? 'done' : (metricForm.unit || '').trim(),
       target: metricForm.measurementType === 'boolean' ? 1 : Number(metricForm.target) || 0,
-      color: metricForm.color || '#38bdf8',
+      color: metricForm.color || '#00F0FF',
       chartType: metricForm.chartType || 'line',
       entries: metrics.find((metric) => metric.id === metricForm.id)?.entries || [],
     }
@@ -1023,9 +1300,11 @@ function Snapshot({ user, updateUser, setToast }) {
 
   return (
     <>
+      <FocusForToday metrics={metrics} habits={user.habits || []} />
+
       <section className="overview-head">
         <div>
-          <h2>Health snapshot</h2>
+          <h2>Health metrics</h2>
           <p>Small, steady shifts create lasting momentum.</p>
         </div>
         <button className="primary-button" onClick={() => setMetricModalOpen(true)}>
@@ -1033,66 +1312,6 @@ function Snapshot({ user, updateUser, setToast }) {
           Add custom metric
         </button>
       </section>
-
-      <div className="metrics-dashboard-grid">
-        <article className={`dashboard-metric-card activity-metric ${getDashboardSnapshot('activity') ? '' : 'is-hidden'}`}>
-          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('activity')?.title}</span>{dashboardActions('activity')}</div>
-          <strong className="dashboard-number">{getDashboardSnapshot('activity')?.value} <small>{getDashboardSnapshot('activity')?.suffix}</small></strong>
-          <div className="activity-heatmap" aria-label="Weekly activity heat map">
-            {Array.from({ length: 28 }, (_, index) => <span key={index} style={{ opacity: 0.25 + ((index * 7) % 6) * 0.13 }} />)}
-          </div>
-          <div className="metric-footline"><span>Distance</span><strong>8.4 km</strong><span>Goal</span><strong>92%</strong></div>
-        </article>
-
-        <article className={`dashboard-metric-card sleep-metric ${getDashboardSnapshot('sleep') ? '' : 'is-hidden'}`}>
-          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('sleep')?.title}</span>{dashboardActions('sleep')}</div>
-          <strong className="dashboard-number">{getDashboardSnapshot('sleep')?.value}</strong>
-          <div className="sparkline-wrap"><svg viewBox="0 0 280 82" role="img" aria-label="Weekly sleep trend"><path className="sparkline-grid" d="M0 20H280M0 48H280M0 76H280" /><path className="sparkline coral" d="M0 55 C22 48 27 35 48 40 S75 67 96 47 S125 22 145 34 S171 55 190 40 S218 18 237 30 S263 45 280 24" /><path className="sparkline blue" d="M0 62 C24 58 34 49 51 52 S76 40 96 55 S125 68 146 50 S170 38 191 47 S219 58 239 45 S264 34 280 39" /></svg></div>
-          <div className="metric-footline"><span>Sleep Avg</span><strong>7h 32m</strong><span>Variance</span><strong>+18m</strong></div>
-        </article>
-
-        <article className={`dashboard-metric-card heart-metric ${getDashboardSnapshot('heart') ? '' : 'is-hidden'}`}>
-          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('heart')?.title}</span>{dashboardActions('heart')}</div>
-          <strong className="dashboard-number">{getDashboardSnapshot('heart')?.value} <small>{getDashboardSnapshot('heart')?.suffix}</small></strong>
-          <div className="heart-bars" aria-label="Daily resting heart rate"><span style={{ height: '45%' }} /><span style={{ height: '66%' }} /><span style={{ height: '54%' }} /><span style={{ height: '74%' }} /><span style={{ height: '42%' }} /><span style={{ height: '58%' }} /><span style={{ height: '35%' }} /></div>
-          <div className="weekday-labels"><span>M</span><span>T</span><span>W</span><span>T</span><span>F</span><span>S</span><span>S</span></div>
-        </article>
-
-        <article className={`dashboard-metric-card score-metric wellness-score ${getDashboardSnapshot('wellness') ? '' : 'is-hidden'}`}>
-          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('wellness')?.title}</span>{dashboardActions('wellness')}</div>
-          <strong className="dashboard-number">{getDashboardSnapshot('wellness')?.value}</strong>
-          <div className="wave-line"><svg viewBox="0 0 280 70"><path d="M0 40 C20 20 32 56 52 36 S85 25 105 42 S138 55 158 30 S192 19 210 39 S246 58 280 22" /></svg></div>
-          <div className="score-submetrics"><span>Sleep Avg <b>7h 32m</b></span><span>Recovery <b>92%</b></span></div>
-        </article>
-
-        <article className={`dashboard-metric-card score-metric focus-score ${getDashboardSnapshot('focus') ? '' : 'is-hidden'}`}>
-          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('focus')?.title}</span>{dashboardActions('focus')}</div>
-          <strong className="dashboard-number">{getDashboardSnapshot('focus')?.value}</strong>
-          <div className="wave-line"><svg viewBox="0 0 280 70"><path d="M0 47 C25 52 33 17 56 37 S88 58 109 35 S142 19 164 42 S194 56 215 31 S252 21 280 35" /></svg></div>
-          <div className="score-submetrics"><span>Deep Work <b>3h 10m</b></span><span>Breaks <b>6</b></span></div>
-        </article>
-
-        <article className={`dashboard-metric-card gauge-metric ${getDashboardSnapshot('stability') ? '' : 'is-hidden'}`}>
-          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('stability')?.title}</span>{dashboardActions('stability')}</div>
-          <div className="radial-gauge"><svg viewBox="0 0 220 130"><path className="radial-track" d="M25 110 A85 85 0 0 1 195 110" /><path className="radial-progress" d="M25 110 A85 85 0 0 1 195 110" pathLength="100" /><circle cx="110" cy="25" r="5" /></svg><div><strong>{getDashboardSnapshot('stability')?.value}</strong><small>{getDashboardSnapshot('stability')?.suffix}</small></div></div>
-          <div className="gauge-modes">{['Balance', 'Performance'].map((mode) => <button type="button" key={mode} className={gaugeMode === mode ? 'active' : ''} onClick={() => setGaugeMode(mode)}>{mode}</button>)}</div>
-          <strong className="gauge-status">Balanced Energy &amp; Recovery State</strong>
-          <small className="gauge-note">Stable pace with room to push.</small>
-        </article>
-      </div>
-
-      {dashboardEditor && (
-        <div className="modal-backdrop" onClick={() => setDashboardEditor(null)}>
-          <div className="modal-card snapshot-editor" onClick={(event) => event.stopPropagation()}>
-            <p className="eyebrow">STANDARD SNAPSHOT</p>
-            <h3>Edit Snapshot</h3>
-            <label className="field-label">Title<input value={dashboardEditor.title} onChange={(event) => setDashboardEditor({ ...dashboardEditor, title: event.target.value })} /></label>
-            <label className="field-label">Value<input value={dashboardEditor.value} onChange={(event) => setDashboardEditor({ ...dashboardEditor, value: event.target.value })} /></label>
-            <label className="field-label">Unit or label<input value={dashboardEditor.suffix} onChange={(event) => setDashboardEditor({ ...dashboardEditor, suffix: event.target.value })} /></label>
-            <div className="routine-actions-row"><button type="button" className="secondary-button" onClick={() => setDashboardEditor(null)}>Cancel</button><button type="button" className="primary-button" onClick={saveDashboardSnapshot}><Save size={14} /> Save Snapshot</button></div>
-          </div>
-        </div>
-      )}
 
       <div className="metric-card-grid">
         {metrics.map((metric) => {
@@ -1122,7 +1341,7 @@ function Snapshot({ user, updateUser, setToast }) {
                 </div>
                 <div className="metric-card-actions">
                   <div className="metric-value-pill">{latestValue}</div>
-                  <button type="button" className="snapshot-edit-button" onClick={(event) => { event.stopPropagation(); editMetric(metric) }}>Edit Snapshot</button>
+                  <button type="button" className="snapshot-edit-button" onClick={(event) => { event.stopPropagation(); editMetric(metric) }}>Edit metric</button>
                   <button type="button" className="icon-button subtle" onClick={(event) => { event.stopPropagation(); deleteMetric(metric.id) }} aria-label={`Delete ${metric.name}`}><Trash2 size={13} /></button>
                   <button
                     type="button"
@@ -1218,41 +1437,8 @@ function Snapshot({ user, updateUser, setToast }) {
         })}
       </div>
 
-      <section className="panel-card insight-card">
-        <div className="panel-heading">
-          <div>
-            <p className="eyebrow">FOCUS FOR TODAY</p>
-            <h3>Restorative momentum</h3>
-          </div>
-          <Sparkles size={18} />
-        </div>
-        <p>
-          Your routine is balanced: move with intention, recover fully, and keep gratitude close to the process.
-        </p>
-
-        <div className="insight-section">
-          <div>
-            <p className="eyebrow">INSIGHTS</p>
-            <h4>Habit completion vs. fasting & sleep</h4>
-          </div>
-          <div className="chart-wrap">
-            <ResponsiveContainer width="100%" height={180}>
-              <LineChart data={trendData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
-                <XAxis dataKey="day" tickLine={false} axisLine={false} />
-                <YAxis tickLine={false} axisLine={false} />
-                <Tooltip />
-                <Legend />
-                <Line type="monotone" dataKey="habits" name="Habit completion %" stroke="var(--chart-cyan)" strokeWidth={3} />
-                <Line type="monotone" dataKey="sleep" name="Sleep quality" stroke="var(--chart-violet)" strokeWidth={3} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      </section>
-
       {metricModalOpen && (
-        <div className="modal-backdrop" onClick={closeMetricModal}>
+        <div className="modal-backdrop metric-modal-backdrop" onClick={closeMetricModal}>
           <div className="metric-modal-card" onClick={(event) => event.stopPropagation()}>
             <div className="metric-modal-header">
               <div>
@@ -2952,7 +3138,7 @@ function FastingView({ user, updateUser, setToast }) {
       benefits: 'May extend the metabolic flexibility and cellular maintenance signals started in ketosis; evidence and timing vary widely.',
     },
     {
-      key: 'immune', range: '48–72+ hrs', label: 'Immune Renewal', max: 72, color: '#60a5fa',
+      key: 'immune', range: '48–72+ hrs', label: 'Immune Renewal', max: 72, color: '#00F0FF',
       hormones: 'Insulin remains low and glucagon high; HGH and norepinephrine help mobilize fuel, while hunger signals remain highly individual.',
       fuel: 'Fatty acids and ketones, with glucose conserved for tissues that require it.', focus: 'Alertness varies sharply; prolonged fasting should never be used to push through concerning symptoms.',
       events: 'Research on prolonged fasting suggests immune-cell and stem-cell signaling changes, but “renewal” is not guaranteed and human evidence remains limited.',
@@ -3274,7 +3460,7 @@ function FastingView({ user, updateUser, setToast }) {
                 <defs>
                   <linearGradient id="fasting-gauge-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
                     <stop offset="0%" stopColor="#5eead4" />
-                    <stop offset="55%" stopColor="#60a5fa" />
+                    <stop offset="55%" stopColor="#00F0FF" />
                     <stop offset="100%" stopColor="#a78bfa" />
                   </linearGradient>
                 </defs>
