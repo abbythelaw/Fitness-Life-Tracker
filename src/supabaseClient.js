@@ -4,10 +4,30 @@ const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
 
 export const supabase = supabaseUrl && supabaseAnonKey
-  ? createClient(supabaseUrl, supabaseAnonKey)
+  ? createClient(supabaseUrl, supabaseAnonKey, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+      },
+    })
   : null
 
 export const isSupabaseConfigured = Boolean(supabase)
+
+export const toCloudProfile = (user) => {
+  if (!user) return null
+  const { password: _password, guest: _guest, ...profile } = user
+  return profile
+}
+
+export const fromCloudProfile = (row, fallback = {}) => ({
+  ...fallback,
+  ...(row?.data || {}),
+  id: row.id,
+  email: row.email,
+  updatedAt: row.updated_at,
+})
 
 export const normalizeSupabaseExercise = (exercise) => {
   const metrics = Array.isArray(exercise.default_metrics)

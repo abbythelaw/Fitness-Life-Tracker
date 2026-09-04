@@ -1,16 +1,13 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Activity,
   Bell,
   ChevronLeft,
   ChevronRight,
   CircleGauge,
-  Clock3,
   Dumbbell,
-  Heart,
   LogOut,
   Menu,
-  Moon,
   NotebookPen,
   Pencil,
   Play,
@@ -36,7 +33,7 @@ import {
 } from 'recharts'
 import './App.css'
 import exercisesSeed from './exercisesSeed'
-import { isSupabaseConfigured, normalizeSupabaseExercise, supabase } from './supabaseClient'
+import { fromCloudProfile, isSupabaseConfigured, normalizeSupabaseExercise, supabase, toCloudProfile } from './supabaseClient'
 
 const uid = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`
 
@@ -346,6 +343,7 @@ const seedUser = (email, name = 'Alex Smith', guest = false) => ({
   activeWorkout: null,
   healthMetrics: seedHealthMetrics,
   logs: seedLogs,
+  exerciseEmoji: '🏋️',
 })
 
 const initialUsers = read('fitlife-users', null) || {
@@ -355,7 +353,9 @@ const nav = [['Snapshot', CircleGauge], ['Exercises', Dumbbell], ['Habits', Acti
 
 function App() {
   const [users, setUsers] = useState(initialUsers)
-  const [session, setSession] = useState(() => read('fitlife-session', null))
+  const [session, setSession] = useState(() => isSupabaseConfigured ? null : read('fitlife-session', null))
+  const [cloudReady, setCloudReady] = useState(!isSupabaseConfigured)
+  const [syncState, setSyncState] = useState(isSupabaseConfigured ? 'connecting' : 'local')
   const [authMode, setAuthMode] = useState('login')
   const [view, setView] = useState('Snapshot')
   const [mobileNav, setMobileNav] = useState(false)
@@ -365,8 +365,103 @@ function App() {
   const user = session ? users[session] : null
 
   useEffect(() => {
+    if (!supabase) return undefined
+    let active = true
+
+    const hydrate = async (authUser) => {
+      if (!authUser) {
+        if (active) {
+          setSession(null)
+          setCloudReady(true)
+          setSyncState('offline')
+        }
+        return
+      }
+
+      setCloudReady(false)
+      setSyncState('syncing')
+      const { data: row, error } = await supabase.from('fitlife_users').select('*').eq('id', authUser.id).maybeSingle()
+      if (error) {
+        if (active) setSyncState('offline')
+        return
+      }
+
+      const account = fromCloudProfile(
+        row,
+        seedUser(authUser.id, authUser.user_metadata?.full_name || authUser.email?.split('@')[0] || 'FitLife member'),
+      )
+      if (!row) {
+        await supabase.from('fitlife_users').insert({
+          id: authUser.id,
+          email: authUser.email,
+          data: toCloudProfile(account),
+          version: 1,
+        })
+      }
+      if (active) {
+        setUsers((all) => ({ ...all, [authUser.id]: account }))
+        setSession(authUser.id)
+        setCloudReady(true)
+        setSyncState('synced')
+      }
+    }
+
+    supabase.auth.getSession().then(({ data }) => hydrate(data.session?.user))
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      window.setTimeout(() => hydrate(nextSession?.user), 0)
+    })
+    return () => {
+      active = false
+      listener.subscription.unsubscribe()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!supabase || !session || !cloudReady || !user || user.guest) return undefined
+    const channel = supabase.channel(`fitlife-sync-${session}`)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'fitlife_users', filter: `id=eq.${session}` }, (payload) => {
+        if (new Date(payload.new.updated_at).getTime() > new Date(user.updatedAt || 0).getTime()) {
+          setUsers((all) => ({ ...all, [session]: fromCloudProfile(payload.new, all[session]) }))
+          setSyncState('synced')
+        }
+      })
+      .subscribe()
+    return () => { supabase.removeChannel(channel) }
+  }, [session, cloudReady, user?.updatedAt])
+
+  useEffect(() => {
     localStorage.setItem('fitlife-users', JSON.stringify(users))
   }, [users])
+
+  const lastSavedUser = useRef(null)
+  useEffect(() => {
+    if (!supabase || !session || !cloudReady || !user || user.guest || lastSavedUser.current === user) return undefined
+    lastSavedUser.current = user
+    const timer = window.setTimeout(async () => {
+      setSyncState('syncing')
+      const changedAt = new Date().toISOString()
+      const { data: remote } = await supabase.from('fitlife_users').select('*').eq('id', session).maybeSingle()
+      if (remote && new Date(remote.updated_at).getTime() > new Date(user.updatedAt || 0).getTime()) {
+        setUsers((all) => ({ ...all, [session]: fromCloudProfile(remote, all[session]) }))
+        setSyncState('synced')
+        return
+      }
+      const { error } = await supabase.from('fitlife_users').upsert({
+        id: session,
+        email: user.email,
+        data: toCloudProfile(user),
+        updated_at: changedAt,
+        version: (remote?.version || 0) + 1,
+      })
+      if (error) {
+        setSyncState('offline')
+      } else {
+        setUsers((all) => ({ ...all, [session]: { ...all[session], updatedAt: changedAt } }))
+        setSyncState('synced')
+      }
+    }, 500)
+    return () => window.clearTimeout(timer)
+  }, [users, session, cloudReady])
 
   useEffect(() => {
     if (session) {
@@ -389,12 +484,15 @@ function App() {
   }, [toast])
 
   useEffect(() => {
-    document.documentElement.dataset.theme = user?.theme || 'light'
+    const theme = user?.theme || 'light'
+    document.documentElement.dataset.theme = theme
+    document.documentElement.classList.remove('light', 'dark', 'ocean', 'forest', 'sunset')
+    document.documentElement.classList.add(theme === 'light' ? 'light' : theme === 'dark' ? 'dark' : theme)
   }, [user?.theme])
 
   const updateUser = (patch) => {
     if (!user) return
-    setUsers((all) => ({ ...all, [user.id]: { ...user, ...patch } }))
+    setUsers((all) => ({ ...all, [user.id]: { ...user, ...patch, updatedAt: new Date().toISOString() } }))
   }
 
   if (!user) {
@@ -406,11 +504,13 @@ function App() {
           setUsers((all) => ({ ...all, [account.id]: account }))
           setSession(account.id)
         }}
+          supabaseEnabled={isSupabaseConfigured}
       />
     )
   }
 
   const logout = () => {
+    if (supabase) supabase.auth.signOut({ scope: 'local' })
     setSession(null)
     setView('Snapshot')
   }
@@ -431,7 +531,7 @@ function App() {
           <div className="avatar">{user.name.split(' ').map((part) => part[0]).join('')}</div>
           <div>
             <strong>{user.name}</strong>
-            <small>{user.guest ? 'Guest preview' : 'Wellness journey'}</small>
+            <small>{user.guest ? 'Guest preview' : syncState === 'synced' ? 'Synced across devices' : syncState}</small>
           </div>
         </div>
 
@@ -488,7 +588,7 @@ function App() {
         {view === 'Fasting' && <FastingView user={user} updateUser={updateUser} setToast={setToast} />}
         {view === 'Log History' && <LogHistoryView user={user} updateUser={updateUser} setToast={setToast} />}
         {view === 'Grateful' && <GratefulView user={user} updateUser={updateUser} setToast={setToast} />}
-        {view === 'Settings' && <SettingsView user={user} updateUser={updateUser} setToast={setToast} />}
+        {view === 'Settings' && <SettingsView user={user} updateUser={updateUser} setToast={setToast} onSignOutAll={() => supabase?.auth.signOut({ scope: 'global' })} />}
       </main>
 
       {toast && <div className="toast">{toast}</div>}
@@ -496,15 +596,35 @@ function App() {
   )
 }
 
-function Auth({ mode, setMode, onAuth }) {
+function Auth({ mode, setMode, onAuth, supabaseEnabled }) {
   const [form, setForm] = useState({ name: '', email: '', password: '' })
   const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
 
-  const submit = (event) => {
+  const submit = async (event) => {
     event.preventDefault()
     const id = form.email.toLowerCase().trim()
     if (!id || !form.password) {
       setError('Enter an email and password.')
+      return
+    }
+
+    if (supabaseEnabled && supabase) {
+      setLoading(true)
+      setError('')
+      const result = mode === 'login'
+        ? await supabase.auth.signInWithPassword({ email: id, password: form.password })
+        : await supabase.auth.signUp({
+            email: id,
+            password: form.password,
+            options: { data: { full_name: form.name.trim() || 'New Member' } },
+          })
+      setLoading(false)
+      if (result.error) {
+        setError(result.error.message)
+      } else if (mode === 'register' && !result.data.session) {
+        setError('Check your email to confirm your account, then log in.')
+      }
       return
     }
 
@@ -558,7 +678,7 @@ function Auth({ mode, setMode, onAuth }) {
           {error && <p className="error">{error}</p>}
 
           <button className="primary-button auth-submit" type="submit">
-            {mode === 'login' ? 'Log in' : 'Create account'}
+            {loading ? 'Connecting...' : mode === 'login' ? 'Log in' : 'Create account'}
           </button>
         </form>
 
@@ -578,23 +698,37 @@ function Auth({ mode, setMode, onAuth }) {
 }
 
 function Snapshot({ user, updateUser, setToast }) {
-  const habitCompletion = user.habits?.length
-    ? Math.round(
-        user.habits.reduce((total, habit) => total + (getHabitCompletionRate(habit) || 0), 0) / user.habits.length,
-      )
-    : 0
-
-  const fastingAverage = user.fastingSessions?.length
-    ? user.fastingSessions.reduce((total, session) => total + (Number(session.completedHours) || 0), 0) /
-        user.fastingSessions.length
-    : 0
-
-  const summary = [
-    { label: 'Gratitude notes', value: user.notes.length, icon: Heart, tone: 'rose' },
-    { label: 'Exercise routines', value: user.routines.length, icon: Dumbbell, tone: 'mint' },
-    { label: 'Habit success', value: `${habitCompletion}%`, icon: Activity, tone: 'lavender' },
-    { label: 'Avg fast', value: `${fastingAverage.toFixed(1)}h`, icon: Clock3, tone: 'sky' },
+  const [gaugeMode, setGaugeMode] = useState('Balance')
+  const defaultDashboardSnapshots = [
+    { id: 'activity', title: 'Activity / Steps', value: '19,840', suffix: 'Steps' },
+    { id: 'sleep', title: 'Sleep / Rest', value: '7h 45m', suffix: '' },
+    { id: 'heart', title: 'Heart / Vitals', value: '63', suffix: 'BPM' },
+    { id: 'wellness', title: 'Wellness Score', value: '87', suffix: 'Index' },
+    { id: 'focus', title: 'Focus Score', value: '73', suffix: 'Index' },
+    { id: 'stability', title: 'Speed / Stability', value: '50%', suffix: 'Live state' },
   ]
+  const dashboardSnapshots = user.dashboardSnapshots || defaultDashboardSnapshots
+  const [dashboardEditor, setDashboardEditor] = useState(null)
+  const getDashboardSnapshot = (id) => dashboardSnapshots.find((snapshot) => snapshot.id === id)
+  const openDashboardEditor = (id) => setDashboardEditor({ ...getDashboardSnapshot(id) })
+  const saveDashboardSnapshot = () => {
+    if (!dashboardEditor?.title.trim()) return
+    updateUser({ dashboardSnapshots: dashboardSnapshots.map((snapshot) => snapshot.id === dashboardEditor.id ? { ...dashboardEditor, title: dashboardEditor.title.trim(), value: dashboardEditor.value.trim(), suffix: dashboardEditor.suffix.trim() } : snapshot) })
+    setDashboardEditor(null)
+    setToast('Snapshot updated')
+  }
+  const deleteDashboardSnapshot = (id) => {
+    const snapshot = getDashboardSnapshot(id)
+    updateUser({ dashboardSnapshots: dashboardSnapshots.filter((item) => item.id !== id) })
+    setToast(`${snapshot?.title || 'Snapshot'} deleted`)
+  }
+  const dashboardActions = (id) => (
+    getDashboardSnapshot(id) &&
+    <div className="dashboard-card-actions">
+      <button type="button" onClick={() => openDashboardEditor(id)}>Edit Snapshot</button>
+      <button type="button" onClick={() => deleteDashboardSnapshot(id)}>Delete</button>
+    </div>
+  )
 
   const trendData = [
     { day: 'Mon', habits: 60, sleep: 7 },
@@ -609,6 +743,7 @@ function Snapshot({ user, updateUser, setToast }) {
   const defaultMetricCategories = ['Heart', 'Mobility', 'General Wellbeing', 'Sleep', 'Mood', 'Exercise Related', 'Overall Health', 'Uncategorized']
   const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
   const [metricModalOpen, setMetricModalOpen] = useState(false)
+  const [chartWindow, setChartWindow] = useState(7)
   const [metricForm, setMetricForm] = useState({
     id: uid(),
     name: '',
@@ -617,6 +752,7 @@ function Snapshot({ user, updateUser, setToast }) {
     unit: '',
     target: '',
     color: '#38bdf8',
+    chartType: 'line',
     customCategory: '',
   })
   const [selectedMetricId, setSelectedMetricId] = useState(null)
@@ -638,6 +774,7 @@ function Snapshot({ user, updateUser, setToast }) {
       unit: '',
       target: '',
       color: '#38bdf8',
+      chartType: 'line',
       customCategory: '',
     })
   }
@@ -678,6 +815,8 @@ function Snapshot({ user, updateUser, setToast }) {
   }
 
   const getMetricProgress = (metric) => {
+    const goalDetails = getMetricGoalDetails(metric, getMetricLatestEntry(metric))
+    if (goalDetails) return goalDetails.progress
     const entry = getMetricLatestEntry(metric)
     if (!entry) return 0
     const raw = Number(entry.value)
@@ -687,6 +826,16 @@ function Snapshot({ user, updateUser, setToast }) {
     if (metric.measurementType === 'scale') return Math.min(100, Math.round((raw / 10) * 100))
     if (metric.measurementType === 'duration') return Math.min(100, Math.round((raw / target) * 100))
     return Math.min(100, Math.round((raw / target) * 100))
+  }
+
+  const getMetricGoalDetails = (metric, latestEntry) => {
+    const current = metric.measurementType === 'boolean' ? (latestEntry?.value ? 1 : 0) : Number(latestEntry?.value)
+    const target = metric.measurementType === 'boolean' ? 1 : Number(metric.target)
+    if (!Number.isFinite(current) || !Number.isFinite(target) || target <= 0) return null
+    const lowerIsBetter = /weight|body fat|resting heart/i.test(metric.name || '')
+    const progress = lowerIsBetter ? Math.min(100, Math.round((target / Math.max(current, target)) * 100)) : Math.min(100, Math.round((current / target) * 100))
+    const distance = Math.abs(target - current)
+    return { current, target, progress, distance, lowerIsBetter }
   }
 
   const getMetricHeatmap = (metric) => {
@@ -712,14 +861,16 @@ function Snapshot({ user, updateUser, setToast }) {
     return days
   }
 
-  const getMetricTrendData = (metric) => {
+  const getMetricTrendData = (metric, limit = null) => {
     const entries = [...(metric.entries || [])].sort((a, b) => new Date(a.date) - new Date(b.date))
-    return entries.map((entry) => ({
+    return (limit ? entries.slice(-limit) : entries).map((entry) => ({
       date: formatDateLabel(entry.date),
       value: metric.measurementType === 'boolean' ? (entry.value ? 1 : 0) : Number(entry.value ?? 0),
       target: metric.measurementType === 'boolean' ? 1 : Number(metric.target || 0),
     }))
   }
+
+  const getMetricProgressValue = (metric) => Math.max(0, Math.min(100, getMetricProgress(metric)))
 
   const handleSaveMetric = () => {
     const cleanName = metricForm.name.trim()
@@ -737,6 +888,7 @@ function Snapshot({ user, updateUser, setToast }) {
       unit: metricForm.measurementType === 'boolean' ? 'done' : (metricForm.unit || '').trim(),
       target: metricForm.measurementType === 'boolean' ? 1 : Number(metricForm.target) || 0,
       color: metricForm.color || '#38bdf8',
+      chartType: metricForm.chartType || 'line',
       entries: metrics.find((metric) => metric.id === metricForm.id)?.entries || [],
     }
 
@@ -749,6 +901,27 @@ function Snapshot({ user, updateUser, setToast }) {
     setSelectedMetricId(normalizedMetric.id)
     resetMetricForm()
     setToast('Custom metric saved')
+  }
+
+  const editMetric = (metric) => {
+    setMetricForm({
+      ...metric,
+      category: metric.category || 'Uncategorized',
+      customCategory: '',
+      chartType: metric.chartType || 'line',
+      target: metric.target || '',
+      unit: metric.unit || '',
+    })
+    setMetricModalOpen(true)
+    setSelectedMetricId(null)
+  }
+
+  const deleteMetric = (metricId) => {
+    const metric = metrics.find((item) => item.id === metricId)
+    if (!metric) return
+    mutateMetrics(metrics.filter((item) => item.id !== metricId))
+    setSelectedMetricId(null)
+    setToast(`${metric.name} deleted`)
   }
 
   const handleDeleteMetricEntry = (metricId, entryId) => {
@@ -852,17 +1025,65 @@ function Snapshot({ user, updateUser, setToast }) {
         </button>
       </section>
 
-      <div className="summary-grid">
-        {summary.map(({ label, value, icon: Icon, tone }) => (
-          <div key={label} className={`summary-card ${tone}`}>
-            <div className="summary-icon">
-              <Icon size={18} />
-            </div>
-            <span>{label}</span>
-            <strong>{value}</strong>
+      <div className="metrics-dashboard-grid">
+        <article className={`dashboard-metric-card activity-metric ${getDashboardSnapshot('activity') ? '' : 'is-hidden'}`}>
+          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('activity')?.title}</span>{dashboardActions('activity')}</div>
+          <strong className="dashboard-number">{getDashboardSnapshot('activity')?.value} <small>{getDashboardSnapshot('activity')?.suffix}</small></strong>
+          <div className="activity-heatmap" aria-label="Weekly activity heat map">
+            {Array.from({ length: 28 }, (_, index) => <span key={index} style={{ opacity: 0.25 + ((index * 7) % 6) * 0.13 }} />)}
           </div>
-        ))}
+          <div className="metric-footline"><span>Distance</span><strong>8.4 km</strong><span>Goal</span><strong>92%</strong></div>
+        </article>
+
+        <article className={`dashboard-metric-card sleep-metric ${getDashboardSnapshot('sleep') ? '' : 'is-hidden'}`}>
+          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('sleep')?.title}</span>{dashboardActions('sleep')}</div>
+          <strong className="dashboard-number">{getDashboardSnapshot('sleep')?.value}</strong>
+          <div className="sparkline-wrap"><svg viewBox="0 0 280 82" role="img" aria-label="Weekly sleep trend"><path className="sparkline-grid" d="M0 20H280M0 48H280M0 76H280" /><path className="sparkline coral" d="M0 55 C22 48 27 35 48 40 S75 67 96 47 S125 22 145 34 S171 55 190 40 S218 18 237 30 S263 45 280 24" /><path className="sparkline blue" d="M0 62 C24 58 34 49 51 52 S76 40 96 55 S125 68 146 50 S170 38 191 47 S219 58 239 45 S264 34 280 39" /></svg></div>
+          <div className="metric-footline"><span>Sleep Avg</span><strong>7h 32m</strong><span>Variance</span><strong>+18m</strong></div>
+        </article>
+
+        <article className={`dashboard-metric-card heart-metric ${getDashboardSnapshot('heart') ? '' : 'is-hidden'}`}>
+          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('heart')?.title}</span>{dashboardActions('heart')}</div>
+          <strong className="dashboard-number">{getDashboardSnapshot('heart')?.value} <small>{getDashboardSnapshot('heart')?.suffix}</small></strong>
+          <div className="heart-bars" aria-label="Daily resting heart rate"><span style={{ height: '45%' }} /><span style={{ height: '66%' }} /><span style={{ height: '54%' }} /><span style={{ height: '74%' }} /><span style={{ height: '42%' }} /><span style={{ height: '58%' }} /><span style={{ height: '35%' }} /></div>
+          <div className="weekday-labels"><span>M</span><span>T</span><span>W</span><span>T</span><span>F</span><span>S</span><span>S</span></div>
+        </article>
+
+        <article className={`dashboard-metric-card score-metric wellness-score ${getDashboardSnapshot('wellness') ? '' : 'is-hidden'}`}>
+          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('wellness')?.title}</span>{dashboardActions('wellness')}</div>
+          <strong className="dashboard-number">{getDashboardSnapshot('wellness')?.value}</strong>
+          <div className="wave-line"><svg viewBox="0 0 280 70"><path d="M0 40 C20 20 32 56 52 36 S85 25 105 42 S138 55 158 30 S192 19 210 39 S246 58 280 22" /></svg></div>
+          <div className="score-submetrics"><span>Sleep Avg <b>7h 32m</b></span><span>Recovery <b>92%</b></span></div>
+        </article>
+
+        <article className={`dashboard-metric-card score-metric focus-score ${getDashboardSnapshot('focus') ? '' : 'is-hidden'}`}>
+          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('focus')?.title}</span>{dashboardActions('focus')}</div>
+          <strong className="dashboard-number">{getDashboardSnapshot('focus')?.value}</strong>
+          <div className="wave-line"><svg viewBox="0 0 280 70"><path d="M0 47 C25 52 33 17 56 37 S88 58 109 35 S142 19 164 42 S194 56 215 31 S252 21 280 35" /></svg></div>
+          <div className="score-submetrics"><span>Deep Work <b>3h 10m</b></span><span>Breaks <b>6</b></span></div>
+        </article>
+
+        <article className={`dashboard-metric-card gauge-metric ${getDashboardSnapshot('stability') ? '' : 'is-hidden'}`}>
+          <div className="dashboard-card-heading"><span>{getDashboardSnapshot('stability')?.title}</span>{dashboardActions('stability')}</div>
+          <div className="radial-gauge"><svg viewBox="0 0 220 130"><path className="radial-track" d="M25 110 A85 85 0 0 1 195 110" /><path className="radial-progress" d="M25 110 A85 85 0 0 1 195 110" pathLength="100" /><circle cx="110" cy="25" r="5" /></svg><div><strong>{getDashboardSnapshot('stability')?.value}</strong><small>{getDashboardSnapshot('stability')?.suffix}</small></div></div>
+          <div className="gauge-modes">{['Balance', 'Performance'].map((mode) => <button type="button" key={mode} className={gaugeMode === mode ? 'active' : ''} onClick={() => setGaugeMode(mode)}>{mode}</button>)}</div>
+          <strong className="gauge-status">Balanced Energy &amp; Recovery State</strong>
+          <small className="gauge-note">Stable pace with room to push.</small>
+        </article>
       </div>
+
+      {dashboardEditor && (
+        <div className="modal-backdrop" onClick={() => setDashboardEditor(null)}>
+          <div className="modal-card snapshot-editor" onClick={(event) => event.stopPropagation()}>
+            <p className="eyebrow">STANDARD SNAPSHOT</p>
+            <h3>Edit Snapshot</h3>
+            <label className="field-label">Title<input value={dashboardEditor.title} onChange={(event) => setDashboardEditor({ ...dashboardEditor, title: event.target.value })} /></label>
+            <label className="field-label">Value<input value={dashboardEditor.value} onChange={(event) => setDashboardEditor({ ...dashboardEditor, value: event.target.value })} /></label>
+            <label className="field-label">Unit or label<input value={dashboardEditor.suffix} onChange={(event) => setDashboardEditor({ ...dashboardEditor, suffix: event.target.value })} /></label>
+            <div className="routine-actions-row"><button type="button" className="secondary-button" onClick={() => setDashboardEditor(null)}>Cancel</button><button type="button" className="primary-button" onClick={saveDashboardSnapshot}><Save size={14} /> Save Snapshot</button></div>
+          </div>
+        </div>
+      )}
 
       <div className="metric-card-grid">
         {metrics.map((metric) => {
@@ -871,6 +1092,9 @@ function Snapshot({ user, updateUser, setToast }) {
           const streak = getMetricStreak(metric)
           const heatmap = getMetricHeatmap(metric)
           const latestValue = latestEntry ? getEntryValue(metric, latestEntry) : 'No data'
+          const barData = getMetricTrendData(metric, chartWindow)
+          const barMax = Math.max(1, ...barData.map((entry) => Number(entry.value) || 0))
+          const goalDetails = getMetricGoalDetails(metric, latestEntry)
 
           return (
             <article
@@ -889,6 +1113,8 @@ function Snapshot({ user, updateUser, setToast }) {
                 </div>
                 <div className="metric-card-actions">
                   <div className="metric-value-pill">{latestValue}</div>
+                  <button type="button" className="snapshot-edit-button" onClick={(event) => { event.stopPropagation(); editMetric(metric) }}>Edit Snapshot</button>
+                  <button type="button" className="icon-button subtle" onClick={(event) => { event.stopPropagation(); deleteMetric(metric.id) }} aria-label={`Delete ${metric.name}`}><Trash2 size={13} /></button>
                   <button
                     type="button"
                     className={`metric-quick-toggle ${isMetricLoggedToday(metric) ? 'done' : ''}`}
@@ -906,6 +1132,14 @@ function Snapshot({ user, updateUser, setToast }) {
                 <span className="metric-target-badge">{progress}% target</span>
                 <span className="metric-streak-badge">🔥 {streak} days</span>
               </div>
+
+              {goalDetails && (
+                <div className="metric-goal-summary">
+                  <div className="metric-goal-values"><span>Current <strong>{goalDetails.current} {metric.unit}</strong></span><span>Target <strong>{goalDetails.target} {metric.unit}</strong></span></div>
+                  <div className="metric-goal-track"><span style={{ width: `${goalDetails.progress}%`, background: metric.color }} /></div>
+                  <small>{goalDetails.distance === 0 ? 'Target reached' : `${goalDetails.distance} ${metric.unit || 'units'} ${goalDetails.lowerIsBetter ? 'above' : 'remaining to'} target`}</small>
+                </div>
+              )}
 
               {metric.measurementType === 'boolean' && (
                 <div className={`metric-bool-pill ${latestEntry?.value ? 'done' : 'pending'}`}>
@@ -936,20 +1170,39 @@ function Snapshot({ user, updateUser, setToast }) {
               </div>
 
               <div className="metric-chart-wrap">
-                <ResponsiveContainer width="100%" height={96}>
-                  <AreaChart data={getMetricTrendData(metric)}>
-                    <defs>
-                      <linearGradient id={`fill-${metric.id}`} x1="0" x2="0" y1="0" y2="1">
-                        <stop offset="0%" stopColor={metric.color} stopOpacity={0.5} />
-                        <stop offset="100%" stopColor={metric.color} stopOpacity={0.06} />
-                      </linearGradient>
-                    </defs>
-                    <XAxis hide dataKey="date" />
-                    <YAxis hide domain={['dataMin - 10', 'dataMax + 10']} />
-                    <Tooltip />
-                    <Area type="monotone" dataKey="value" stroke={metric.color} strokeWidth={2.5} fill={`url(#fill-${metric.id})`} />
-                  </AreaChart>
-                </ResponsiveContainer>
+                {metric.chartType === 'bar' ? (
+                  <>
+                    <div className="chart-window-toggle"><span>Bar view</span><button type="button" className={chartWindow === 7 ? 'active' : ''} onClick={(event) => { event.stopPropagation(); setChartWindow(7) }}>7D</button><button type="button" className={chartWindow === 30 ? 'active' : ''} onClick={(event) => { event.stopPropagation(); setChartWindow(30) }}>30D</button></div>
+                    <div className="metric-bar-chart">
+                      <div className="metric-y-axis"><span>{barMax}</span><span>{Math.round(barMax / 2)}</span><span>0</span></div>
+                      <div className="metric-bar-plot">
+                        {metric.target > 0 && <span className="metric-bar-target" style={{ bottom: `${Math.min(100, (Number(metric.target) / barMax) * 100)}%` }} />}
+                        <div className="metric-bars" aria-label={`${metric.name} bar chart`}>
+                          {barData.map((entry, index) => <span key={`${metric.id}-bar-${index}`} style={{ height: `${Math.max(8, ((Number(entry.value) || 0) / barMax) * 100)}%`, background: metric.color }} title={`${entry.date}: ${entry.value}`} />)}
+                        </div>
+                        <div className="metric-x-axis">{barData.map((entry, index) => <span key={`${metric.id}-bar-label-${index}`}>{entry.date.slice(0, 5)}</span>)}</div>
+                      </div>
+                    </div>
+                  </>
+                ) : metric.chartType === 'radial' ? (
+                  <div className="metric-radial-chart"><svg viewBox="0 0 160 95"><path className="metric-radial-track" d="M20 80 A60 60 0 0 1 140 80" /><path className="metric-radial-progress" d="M20 80 A60 60 0 0 1 140 80" pathLength="100" style={{ stroke: metric.color, strokeDasharray: `${getMetricProgressValue(metric)} 100` }} /></svg><strong>{getMetricProgressValue(metric)}%</strong></div>
+                ) : (
+                  <ResponsiveContainer width="100%" height={96}>
+                    <AreaChart data={getMetricTrendData(metric)}>
+                      <defs>
+                        <linearGradient id={`fill-${metric.id}`} x1="0" x2="0" y1="0" y2="1">
+                          <stop offset="0%" stopColor={metric.color} stopOpacity={0.5} />
+                          <stop offset="100%" stopColor={metric.color} stopOpacity={0.06} />
+                        </linearGradient>
+                      </defs>
+                      <XAxis dataKey="date" tickLine={false} axisLine={{ stroke: 'var(--chart-grid)' }} tick={{ fill: 'var(--muted)', fontSize: 9 }} minTickGap={18} />
+                      <YAxis width={30} tickLine={false} axisLine={{ stroke: 'var(--chart-grid)' }} tick={{ fill: 'var(--muted)', fontSize: 9 }} domain={['dataMin - 10', 'dataMax + 10']} />
+                      <Tooltip />
+                      <Area type="monotone" dataKey="value" stroke={metric.color} strokeWidth={2.5} fill={`url(#fill-${metric.id})`} />
+                      <Line type="monotone" dataKey="target" stroke="var(--chart-target)" strokeDasharray="5 5" strokeWidth={1.5} dot={false} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                )}
               </div>
             </article>
           )
@@ -976,13 +1229,13 @@ function Snapshot({ user, updateUser, setToast }) {
           <div className="chart-wrap">
             <ResponsiveContainer width="100%" height={180}>
               <LineChart data={trendData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.22)" />
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                 <XAxis dataKey="day" tickLine={false} axisLine={false} />
                 <YAxis tickLine={false} axisLine={false} />
                 <Tooltip />
                 <Legend />
-                <Line type="monotone" dataKey="habits" name="Habit completion %" stroke="#7ad1bb" strokeWidth={3} />
-                <Line type="monotone" dataKey="sleep" name="Sleep quality" stroke="#c4b5fd" strokeWidth={3} />
+                <Line type="monotone" dataKey="habits" name="Habit completion %" stroke="var(--chart-cyan)" strokeWidth={3} />
+                <Line type="monotone" dataKey="sleep" name="Sleep quality" stroke="var(--chart-violet)" strokeWidth={3} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -994,7 +1247,7 @@ function Snapshot({ user, updateUser, setToast }) {
           <div className="metric-modal-card" onClick={(event) => event.stopPropagation()}>
             <div className="metric-modal-header">
               <div>
-                <p className="eyebrow">ADD CUSTOM METRIC</p>
+                <p className="eyebrow">{metrics.some((metric) => metric.id === metricForm.id) ? 'EDIT SNAPSHOT' : 'ADD CUSTOM METRIC'}</p>
                 <h3>{metricForm.name || 'New health metric'}</h3>
               </div>
               <button className="icon-button subtle" onClick={closeMetricModal} aria-label="Close metric form">
@@ -1053,6 +1306,15 @@ function Snapshot({ user, updateUser, setToast }) {
               </div>
             </div>
 
+            <label className="field-label">
+              Chart Type
+              <select value={metricForm.chartType} onChange={(event) => setMetricForm({ ...metricForm, chartType: event.target.value })}>
+                <option value="line">Line Graph</option>
+                <option value="bar">Bar Graph</option>
+                <option value="radial">Half-Circle Gauge</option>
+              </select>
+            </label>
+
             <div className="field-grid two-up">
               <label className="field-label">
                 Unit
@@ -1110,9 +1372,9 @@ function Snapshot({ user, updateUser, setToast }) {
                 <button
                   type="button"
                   className="primary-button compact-inline"
-                  onClick={() => setEntryEditor({ metricId: selectedMetric.id, entryId: null, date: todayValue(), value: getQuickMetricValue(selectedMetric) })}
+                  onClick={() => setEntryEditor({ metricId: selectedMetric.id, entryId: null, date: toLocalDateTimeValue(new Date()), value: getQuickMetricValue(selectedMetric) })}
                 >
-                  + Quick Log Entry
+                  Add Entry
                 </button>
                 <button className="icon-button subtle" onClick={closeMetricDetail} aria-label="Close metric detail">
                   <X size={15} />
@@ -1165,23 +1427,23 @@ function Snapshot({ user, updateUser, setToast }) {
                       <stop offset="100%" stopColor={selectedMetric.color} stopOpacity={0.06} />
                     </linearGradient>
                   </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.18)" />
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                   <XAxis dataKey="date" tickLine={false} axisLine={false} fontSize={11} />
                   <YAxis tickLine={false} axisLine={false} fontSize={11} />
                   <Tooltip />
                   <Area type="monotone" dataKey="value" stroke={selectedMetric.color} strokeWidth={3} fill={`url(#detail-fill-${selectedMetric.id})`} />
-                  <Line type="monotone" dataKey="target" stroke="rgba(255,255,255,0.46)" strokeDasharray="5 5" strokeWidth={1.5} />
+                  <Line type="monotone" dataKey="target" stroke="var(--chart-target)" strokeDasharray="5 5" strokeWidth={1.5} />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
 
             {entryEditor && (
               <div className="entry-editor">
-                <strong>{entryEditor.entryId ? 'Edit log entry' : 'Add quick log entry'}</strong>
+                <strong>{entryEditor.entryId ? 'Edit log entry' : 'Add entry'}</strong>
                 <div className="field-grid two-up">
                   <label className="field-label">
-                    Date
-                    <input type="date" value={entryEditor.date} onChange={(event) => setEntryEditor({ ...entryEditor, date: event.target.value })} />
+                    Date &amp; time
+                    <input type="datetime-local" step="1" value={entryEditor.date} onChange={(event) => setEntryEditor({ ...entryEditor, date: event.target.value })} />
                   </label>
                   <label className="field-label">
                     Value
@@ -1203,7 +1465,7 @@ function Snapshot({ user, updateUser, setToast }) {
                     <small style={{ color: selectedMetric.color }}>{getEntryValue(selectedMetric, entry)}</small>
                   </div>
                   <div className="row-actions">
-                    <button className="icon-button subtle" onClick={() => setEntryEditor({ metricId: selectedMetric.id, entryId: entry.id, date: formatDayKey(entry.date), value: entry.value })} aria-label="Edit metric entry">
+                    <button className="icon-button subtle" onClick={() => setEntryEditor({ metricId: selectedMetric.id, entryId: entry.id, date: toLocalDateTimeValue(new Date(entry.date)), value: entry.value })} aria-label="Edit metric entry">
                       <Pencil size={14} />
                     </button>
                     <button className="icon-button subtle" onClick={() => handleDeleteMetricEntry(selectedMetric.id, entry.id)} aria-label="Delete metric entry">
@@ -1383,6 +1645,7 @@ function ExercisesView({ user, updateUser, setToast }) {
   const finishWorkout = () => {
     if (!activeWorkout) return
     const end = new Date()
+    const activeRoutine = user.routines.find((routine) => routine.id === activeWorkout.routineId)
     const durationMs = end.getTime() - new Date(activeWorkout.startedAt).getTime()
     const durationMinutes = Math.max(1, Math.round(durationMs / 60000))
     const workoutLogId = uid()
@@ -1417,7 +1680,7 @@ function ExercisesView({ user, updateUser, setToast }) {
       logs: [{
         id: workoutLogId,
         type: 'Workout',
-        icon: '🏋️',
+        icon: activeRoutine?.exerciseEmoji || user.exerciseEmoji || '🏋️',
         title: activeWorkout.routineName,
         date: end.toISOString(),
         summary: `${durationMinutes} min • ${activeWorkout.routineName}`,
@@ -1820,7 +2083,7 @@ function ExercisesView({ user, updateUser, setToast }) {
                 </div>
               </div>
 
-              <div className="routine-timer-row">
+                <div className="routine-timer-row">
                 <span className="routine-status-badge">{isActive ? 'Live' : 'Ready'}</span>
                 <strong>{isActive ? formatDuration(elapsed) : `${routine.exercises.length} moves`}</strong>
               </div>
@@ -1877,7 +2140,7 @@ function ExercisesView({ user, updateUser, setToast }) {
                         <div className="live-exercise-panel">
                           <div className="live-exercise-head">
                             <button className={`exercise-complete-toggle ${progressState.completed ? 'done' : ''}`} onClick={() => toggleExerciseComplete(routine.id, exerciseKey)}>
-                              {progressState.completed ? '✓ Done' : 'Exercise Completed'}
+                              {progressState.completed ? 'Done' : 'Exercise Completed'}
                             </button>
                             {restUntil && restUntil > workoutNow.getTime() && <small className="rest-timer">Rest {formatDuration(restUntil - workoutNow.getTime()).slice(3)}</small>}
                           </div>
@@ -1886,7 +2149,7 @@ function ExercisesView({ user, updateUser, setToast }) {
                               <label key={`${routine.id}-${exerciseKey}-${setIndex}`} className="set-check-item">
                                 <span>Set {setIndex + 1}</span>
                                 {exercise.trackingType === 'duration' ? <><input value={progressState.sets[setIndex]?.duration || ''} onChange={(event) => updateWorkoutSetField(routine.id, exerciseKey, setIndex, 'duration', event.target.value)} placeholder="MM:SS" /><input value={progressState.sets[setIndex]?.distance || ''} onChange={(event) => updateWorkoutSetField(routine.id, exerciseKey, setIndex, 'distance', event.target.value)} placeholder="km" /></> : <><input type="number" value={progressState.sets[setIndex]?.reps ?? ''} onChange={(event) => updateWorkoutSetField(routine.id, exerciseKey, setIndex, 'reps', event.target.value)} placeholder="reps" /><input type="number" value={progressState.sets[setIndex]?.weight ?? ''} onChange={(event) => updateWorkoutSetField(routine.id, exerciseKey, setIndex, 'weight', event.target.value)} placeholder="kg" /></>}
-                                <button type="button" className={`exercise-complete-toggle ${progressState.sets[setIndex]?.completed ? 'done' : ''}`} onClick={() => toggleWorkoutSet(routine.id, exerciseKey, setIndex)}>{progressState.sets[setIndex]?.completed ? '✓ Done' : 'Not Done'}</button>
+                                <button type="button" className={`exercise-complete-toggle ${progressState.sets[setIndex]?.completed ? 'done' : ''}`} onClick={() => toggleWorkoutSet(routine.id, exerciseKey, setIndex)}>{progressState.sets[setIndex]?.completed ? 'Done' : 'Not Done'}</button>
                               </label>
                             ))}
                           </div>
@@ -2208,6 +2471,7 @@ function HabitView({ user, updateUser, setToast }) {
   }
 
   const toggleHabitDay = (habitId, dayKey) => {
+    if (dayKey > todayValue()) return
     const habit = user.habits.find((item) => item.id === habitId)
     if (!habit) return
 
@@ -2265,7 +2529,20 @@ function HabitView({ user, updateUser, setToast }) {
     })
   }
 
-  const contributionDays = getLastNDays(35)
+  const calendarMonthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1)
+  const calendarOffset = (calendarMonthStart.getDay() + 6) % 7
+  const calendarGridStart = new Date(calendarMonthStart)
+  calendarGridStart.setDate(calendarGridStart.getDate() - calendarOffset)
+  const contributionDays = Array.from({ length: 42 }, (_, index) => {
+    const date = new Date(calendarGridStart)
+    date.setDate(calendarGridStart.getDate() + index)
+    return date
+  })
+  const getDayHabitSummary = (date) => {
+    const dayKey = formatDayKey(date)
+    const performed = user.habits.filter((habit) => (habit.logs || []).find((entry) => entry.date === dayKey)?.done).length
+    return { dayKey, performed, total: user.habits.length }
+  }
   const selectedHabit = user.habits.find((habit) => habit.id === selectedHabitId) || user.habits[0] || null
 
   const getHabitTodayEntry = (habit) => {
@@ -2348,15 +2625,10 @@ function HabitView({ user, updateUser, setToast }) {
           )}
         </div>
 
-        <div className="field-grid two-up">
+        <div className="field-grid">
           <label className="field-label">
             Habit Name
             <input value={form.name} onChange={(event) => updateField('name', event.target.value)} placeholder="Daily walk / Read 10 pages" />
-          </label>
-
-          <label className="field-label">
-            Icon
-            <input value={form.icon} onChange={(event) => updateField('icon', event.target.value)} maxLength={2} placeholder="💪" />
           </label>
         </div>
 
@@ -2428,6 +2700,27 @@ function HabitView({ user, updateUser, setToast }) {
         </div>
       </div>
 
+      <section className="panel-card habit-overview-calendar">
+        <div className="panel-heading compact">
+          <div><p className="eyebrow">CONTRIBUTION GRID</p><h3>Habits performed</h3></div>
+          <span className="habit-calendar-month">{new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric' }).format(calendarMonthStart)}</span>
+        </div>
+        <div className="habit-calendar-weekdays" aria-hidden="true">{['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((label, index) => <span key={`overview-weekday-${index}`}>{label}</span>)}</div>
+        <div className="habit-overview-grid">
+          {contributionDays.map((date) => {
+            const summary = getDayHabitSummary(date)
+            const isOutsideMonth = date.getMonth() !== calendarMonthStart.getMonth()
+            const dateLabel = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(date)
+            return (
+              <button key={`overview-${summary.dayKey}`} type="button" disabled={summary.dayKey > todayValue()} className={`habit-overview-cell ${summary.performed ? 'has-progress' : ''} ${isOutsideMonth ? 'outside-month' : ''}`} title={`${dateLabel}: ${summary.performed}/${summary.total} Habits performed`} aria-label={`${dateLabel}: ${summary.performed}/${summary.total} Habits performed`}>
+                <strong>{dateLabel}</strong>
+                <small>{summary.performed}/{summary.total} Habits performed</small>
+              </button>
+            )
+          })}
+        </div>
+      </section>
+
       <div className="habit-grid">
         {user.habits.map((habit) => {
           const completionRate = getHabitCompletionRate(habit)
@@ -2438,7 +2731,6 @@ function HabitView({ user, updateUser, setToast }) {
             <article key={habit.id} className="habit-card panel-card" onClick={() => setSelectedHabitId(habit.id)}>
               <div className="habit-header-row">
                 <div className="habit-title-wrap">
-                  <span className="habit-icon">{habit.icon || '💪'}</span>
                   <div>
                     <strong>{habit.name}</strong>
                     <small>{habit.category}</small>
@@ -2454,7 +2746,7 @@ function HabitView({ user, updateUser, setToast }) {
                       quickLogHabit(habit.id)
                     }}
                   >
-                    {getHabitTodayEntry(habit)?.done ? '✓ Completed Today' : 'Log Today'}
+                    {getHabitTodayEntry(habit)?.done ? 'Completed Today' : 'Log Today'}
                   </button>
                 </div>
               </div>
@@ -2464,22 +2756,33 @@ function HabitView({ user, updateUser, setToast }) {
                 <span>{(habit.trackingType || 'boolean') === 'time' ? `Target ${habit.targetValue || habit.target || '--'}` : (habit.trackingType || 'boolean') === 'numeric' ? `${habit.targetValue || habit.target || 0} ${habit.unit || 'units'} target` : 'Daily check-in'}</span>
               </div>
 
+              <div className="habit-grid-months" aria-hidden="true"><span>{new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric' }).format(calendarMonthStart)}</span></div>
+              <div className="habit-grid-axis-labels" aria-hidden="true">
+                {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((label, index) => <span key={`${habit.id}-axis-${index}`}>{label}</span>)}
+              </div>
               <div className="habit-contribution-grid">
                 {contributionDays.map((date) => {
                   const key = formatDayKey(date)
-                  const done = (habit.logs || []).find((entry) => entry.date === key)?.done
+                  const entry = (habit.logs || []).find((item) => item.date === key)
+                  const done = entry?.done
                   const isToday = key === todayValue()
+                  const isOutsideMonth = date.getMonth() !== calendarMonthStart.getMonth()
+                  const isFuture = key > todayValue()
+                  const dateLabel = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(date)
+                  const statusLabel = done ? `Completed${entry?.value ? ` • ${entry.value} ${habit.unit || ''}` : ''}` : 'Not completed'
                   return (
                     <button
                       key={`${habit.id}-${key}`}
                       type="button"
-                      className={`day-box contribution-box ${done ? 'done' : ''} ${isToday ? 'today' : ''}`}
+                      disabled={isFuture}
+                      className={`day-box contribution-box ${done ? 'done' : ''} ${isToday ? 'today' : ''} ${isOutsideMonth ? 'outside-month' : ''} ${isFuture ? 'future-date' : ''}`}
                       onClick={(event) => { event.stopPropagation(); toggleHabitDay(habit.id, key) }}
-                      title={`${new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(date)}`}
-                      aria-label={`${new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(date)}`}
+                      title={`${dateLabel}: ${statusLabel}`}
+                      aria-label={`${dateLabel}: ${statusLabel}`}
                     >
                       <span className="mini-month">{new Intl.DateTimeFormat('en-US', { month: 'short' }).format(date).toUpperCase()}</span>
                       <span className="mini-day">{String(date.getDate())}</span>
+                      <span className="habit-tooltip" role="tooltip">{dateLabel}<br />{statusLabel}</span>
                     </button>
                   )
                 })}
@@ -2499,7 +2802,7 @@ function HabitView({ user, updateUser, setToast }) {
                 </div>
                 <ResponsiveContainer width="100%" height={90}>
                   <LineChart data={buildTrendData(habit)}>
-                    <Line type="monotone" dataKey="value" stroke="#7ad1bb" strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="value" stroke="var(--chart-cyan)" strokeWidth={2} dot={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -2544,7 +2847,7 @@ function HabitView({ user, updateUser, setToast }) {
           <div className="panel-heading compact">
             <div>
               <p className="eyebrow">DETAIL VIEW</p>
-              <h3>{selectedHabit.icon} {selectedHabit.name}</h3>
+              <h3>{selectedHabit.name}</h3>
             </div>
             <button className="ghost-button" onClick={() => editHabit(selectedHabit)}>
               <Pencil size={14} />
@@ -2581,13 +2884,13 @@ function HabitView({ user, updateUser, setToast }) {
             <h4>Dual-axis trend comparison</h4>
             <ResponsiveContainer width="100%" height={200}>
               <LineChart data={buildTrendData(selectedHabit)}>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(148, 163, 184, 0.2)" />
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                 <XAxis dataKey="date" tickLine={false} axisLine={false} />
                 <YAxis domain={[0, 1]} tickLine={false} axisLine={false} />
                 <Tooltip />
                 <Legend />
-                <Line type="monotone" dataKey="value" name={selectedHabit.name} stroke="#7ad1bb" strokeWidth={2} />
-                <Line type="monotone" dataKey="value" name="Sleep quality" stroke="#c7d2fe" strokeWidth={2} strokeDasharray="6 6" />
+                <Line type="monotone" dataKey="value" name={selectedHabit.name} stroke="var(--chart-cyan)" strokeWidth={2} />
+                <Line type="monotone" dataKey="value" name="Sleep quality" stroke="var(--chart-violet)" strokeWidth={2} strokeDasharray="6 6" />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -2610,6 +2913,43 @@ function HabitView({ user, updateUser, setToast }) {
 }
 
 function FastingView({ user, updateUser, setToast }) {
+  const fastingStages = [
+    {
+      key: 'fed', range: '0–4 hrs', label: 'Fed State', max: 4, color: '#f9a8d4',
+      hormones: 'Ghrelin is generally quiet after eating; insulin rises, glucagon stays low, HGH is at baseline, and adrenaline/norepinephrine remain steady.',
+      fuel: 'Exogenous glucose from the recent meal.', focus: 'Post-meal calm or lethargy as digestion takes priority.',
+      events: 'Nutrients are being absorbed and stored as glycogen or fat. This is the normal fed baseline, not a failure state.',
+      benefits: 'Supports replenishment and recovery, while helping you learn the difference between true hunger and routine appetite.',
+    },
+    {
+      key: 'glycogen', range: '4–12 hrs', label: 'Glycogen Phase', max: 12, color: '#fbbf24',
+      hormones: 'Ghrelin may pulse around habitual meal times; insulin trends down, glucagon rises, HGH begins to increase, and norepinephrine stays available.',
+      fuel: 'Liver glycogen, with glucose still supporting much of the brain and muscle demand.', focus: 'Steady attention with occasional hunger waves that often pass.',
+      events: 'The liver gradually releases stored glucose to keep blood sugar stable as the post-meal supply fades.',
+      benefits: 'Builds routine consistency and improves metabolic flexibility without requiring an extreme fast.',
+    },
+    {
+      key: 'switch', range: '12–24 hrs', label: 'Metabolic Switch & Ketosis', max: 24, color: '#5eead4',
+      hormones: 'Ghrelin pulses can become less frequent; insulin is low, glucagon is elevated, HGH surges support lean tissue, and adrenaline/norepinephrine support alertness.',
+      fuel: 'Fatty acids and ketones, especially BHB and acetoacetate, as glycogen availability falls.', focus: 'Many people report heightened focus; ketones and BDNF signaling may support alertness.',
+      events: 'Glycogen depletion increases fat mobilization and ketone production. Inflammation may begin to ease, though responses vary by person.',
+      benefits: 'Practices switching between carbohydrate and fat fuel, supporting weight-management habits and sustained mental clarity.',
+    },
+    {
+      key: 'autophagy', range: '24–48 hrs', label: 'Deep Autophagy', max: 48, color: '#a78bfa',
+      hormones: 'Ghrelin remains individual and wave-like; insulin stays low, glucagon high, HGH remains elevated, and catecholamines help preserve energy and alertness.',
+      fuel: 'Predominantly fatty acids and ketones, with limited glucose made by gluconeogenesis.', focus: 'Focus can feel clear for some and depleted for others; sleep, hydration, and individual health matter.',
+      events: 'Cellular recycling pathways including autophagy become more active in some tissues as nutrient signaling stays low. Human timing is not a fixed switch.',
+      benefits: 'May extend the metabolic flexibility and cellular maintenance signals started in ketosis; evidence and timing vary widely.',
+    },
+    {
+      key: 'immune', range: '48–72+ hrs', label: 'Immune Renewal', max: 72, color: '#60a5fa',
+      hormones: 'Insulin remains low and glucagon high; HGH and norepinephrine help mobilize fuel, while hunger signals remain highly individual.',
+      fuel: 'Fatty acids and ketones, with glucose conserved for tissues that require it.', focus: 'Alertness varies sharply; prolonged fasting should never be used to push through concerning symptoms.',
+      events: 'Research on prolonged fasting suggests immune-cell and stem-cell signaling changes, but “renewal” is not guaranteed and human evidence remains limited.',
+      benefits: 'Represents a research frontier rather than a required wellness milestone. Longer fasts need medical guidance, especially with medication or chronic illness.',
+    },
+  ]
   const presetOptions = [
     { label: '12:12', hours: 12, minutes: 12 },
     { label: '14:10', hours: 14, minutes: 10 },
@@ -2637,6 +2977,9 @@ function FastingView({ user, updateUser, setToast }) {
   const [form, setForm] = useState(buildPlan())
   const [activeFast, setActiveFast] = useState(() => user.activeFast || null)
   const [currentTick, setCurrentTick] = useState(new Date())
+  const [selectedStageKey, setSelectedStageKey] = useState(null)
+  const [startEditorOpen, setStartEditorOpen] = useState(false)
+  const [startEditorValue, setStartEditorValue] = useState('')
 
   useEffect(() => {
     const timer = window.setInterval(() => setCurrentTick(new Date()), 1000)
@@ -2751,6 +3094,30 @@ function FastingView({ user, updateUser, setToast }) {
     setToast('Fast completed and logged')
   }
 
+  const openStartEditor = () => {
+    setStartEditorValue(activeFast ? toLocalDateTimeValue(new Date(activeFast.start)) : form.start)
+    setStartEditorOpen(true)
+  }
+
+  const saveStartTime = () => {
+    if (!activeFast) return
+    const nextStart = new Date(startEditorValue)
+    if (Number.isNaN(nextStart.getTime()) || nextStart > new Date()) {
+      setToast('Start time must be a valid time in the past.')
+      return
+    }
+    const nextEnd = addMinutes(nextStart, Number(activeFast.targetHours || 12) * 60)
+    const nextFast = {
+      ...activeFast,
+      start: nextStart.toISOString(),
+      end: nextEnd.toISOString(),
+    }
+    setActiveFast(nextFast)
+    setForm((current) => ({ ...current, start: toLocalDateTimeValue(nextStart), end: toLocalDateTimeValue(nextEnd), expectedEnd: toLocalDateTimeValue(nextEnd) }))
+    setStartEditorOpen(false)
+    setToast('Fast start time updated')
+  }
+
   const loadSession = (session) => {
     setForm({
       start: toLocalDateTimeValue(session.start),
@@ -2767,6 +3134,27 @@ function FastingView({ user, updateUser, setToast }) {
   const targetHours = activeFast ? Number(activeFast.targetHours) || 12 : 12
   const elapsedProgress = activeFast ? Math.min((totalElapsedHours / targetHours) * 100, 100) : 0
   const currentStage = activeFast ? getStageLabel(activeFast.start, currentTick) : 'FED'
+  const gaugeAngle = (elapsedProgress / 100) * Math.PI * 2
+  const gaugeMarkerX = 120 + 96 * Math.cos(gaugeAngle)
+  const gaugeMarkerY = 120 + 96 * Math.sin(gaugeAngle)
+  const fastingDayTotals = (user.fastingSessions || []).reduce((totals, session) => {
+    const day = formatDayKey(session.start)
+    totals[day] = (totals[day] || 0) + (Number(session.completedHours || session.hours) || 0)
+    return totals
+  }, {})
+  const fastingCalendarStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1)
+  const fastingCalendarDays = Array.from({ length: new Date(fastingCalendarStart.getFullYear(), fastingCalendarStart.getMonth() + 1, 0).getDate() }, (_, index) => new Date(fastingCalendarStart.getFullYear(), fastingCalendarStart.getMonth(), index + 1))
+  const latestFastDay = Object.keys(fastingDayTotals).sort().pop()
+  let fastingStreak = 0
+  if (latestFastDay) {
+    const streakCursor = new Date(`${latestFastDay}T12:00:00`)
+    while (fastingDayTotals[formatDayKey(streakCursor)]) {
+      fastingStreak += 1
+      streakCursor.setDate(streakCursor.getDate() - 1)
+    }
+  }
+  const activeStageIndex = Math.min(fastingStages.length - 1, fastingStages.findIndex((stage) => totalElapsedHours < stage.max) < 0 ? fastingStages.length - 1 : fastingStages.findIndex((stage) => totalElapsedHours < stage.max))
+  const selectedStage = fastingStages.find((stage) => stage.key === selectedStageKey) || fastingStages[activeStageIndex]
 
   return (
     <>
@@ -2774,6 +3162,23 @@ function FastingView({ user, updateUser, setToast }) {
         <div>
           <h2>Fasting tracker</h2>
           <p>Plan your next fast, see the stage in real time, and review your history.</p>
+        </div>
+      </section>
+
+      <section className="fasting-summary-grid">
+        <div className="fasting-streak-card">
+          <span className="fasting-streak-flame" aria-hidden="true">🔥</span>
+          <div><p className="eyebrow">CONSISTENCY</p><strong>{fastingStreak}-Day Streak</strong><small>Consecutive logged fasting days</small></div>
+        </div>
+        <div className="fasting-calendar-card">
+          <div className="fasting-calendar-heading"><div><p className="eyebrow">FASTING CALENDAR</p><strong>{new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric' }).format(fastingCalendarStart)}</strong></div><small>Hours logged</small></div>
+          <div className="fasting-calendar-grid">
+            {fastingCalendarDays.map((date) => {
+              const day = formatDayKey(date)
+              const hours = fastingDayTotals[day] || 0
+              return <span key={day} className={`fast-day-cell ${hours ? 'completed' : ''}`} title={`${new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(date)}: ${hours ? `${hours.toFixed(1)}h logged` : 'No fast logged'}`}><b>{date.getDate()}</b>{hours ? <small>{hours.toFixed(0)}h</small> : null}</span>
+            })}
+          </div>
         </div>
       </section>
 
@@ -2797,6 +3202,13 @@ function FastingView({ user, updateUser, setToast }) {
               <input type="datetime-local" step="1" value={form.end} onChange={(event) => updateForm('end', event.target.value)} />
             </label>
           </div>
+
+          {activeFast && (
+            <button type="button" className="ghost-button start-time-button" onClick={openStartEditor}>
+              <Pencil size={14} />
+              Update Start Date &amp; Time
+            </button>
+          )}
 
           <div className="field-grid two-up">
             <label className="field-label">
@@ -2848,39 +3260,62 @@ function FastingView({ user, updateUser, setToast }) {
           </label>
 
           <div className="timer-shell">
-            <div className="progress-ring" style={{ background: `conic-gradient(#7ad1bb ${elapsedProgress}%, rgba(148, 163, 184, 0.18) 0)` }}>
-              <div className="progress-ring-inner">
+            <div className="countdown-gauge" style={{ '--gauge-progress': `${elapsedProgress}%` }}>
+              <svg viewBox="0 0 240 240" role="img" aria-label={`${elapsedProgress.toFixed(0)} percent of fast elapsed`}>
+                <defs>
+                  <linearGradient id="fasting-gauge-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stopColor="#5eead4" />
+                    <stop offset="55%" stopColor="#60a5fa" />
+                    <stop offset="100%" stopColor="#a78bfa" />
+                  </linearGradient>
+                </defs>
+                <circle className="gauge-track" cx="120" cy="120" r="96" />
+                <circle className="gauge-progress" cx="120" cy="120" r="96" pathLength="100" />
+                <circle className="gauge-marker" cx={gaugeMarkerX} cy={gaugeMarkerY} r="6" />
+              </svg>
+              <div className="countdown-center">
+                <small>Elapsed time ({elapsedProgress.toFixed(0)}%)</small>
                 <strong>{activeFast ? formatDuration(totalElapsedHours * 3600000) : '00:00:00'}</strong>
-                <span>{currentStage}</span>
-                <small>{activeFast ? `target ${targetHours.toFixed(1)}h` : 'target 12:12'}</small>
+                <span className="phase-badge">{currentStage}</span>
               </div>
             </div>
 
-            <button className="primary-button big-button" onClick={activeFast ? endFast : startFast}>
+            <div className="countdown-meta">
+              <div><small>STARTED FASTING</small><strong>{activeFast ? new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(activeFast.start)) : '--:--'}</strong></div>
+              <div><small>FAST ENDING</small><strong>{activeFast ? new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(activeFast.end)) : '--:--'}</strong></div>
+            </div>
+
+            <button className="primary-button big-button countdown-action" onClick={activeFast ? endFast : startFast}>
               {activeFast ? 'End Fast' : 'Start Fast'}
             </button>
           </div>
 
           <div className="timeline-wrap">
             <p className="eyebrow">FASTING STAGES</p>
+            <div className="fasting-timeline-line" style={{ '--timeline-progress': `${activeFast ? Math.min(100, (totalElapsedHours / 72) * 100) : 0}%` }} />
             <div className="stages-timeline">
-              {[
-                { label: 'Fed 0h+', start: '0h', end: '4h' },
-                { label: 'Early Fasting 4h+', start: '4h', end: '12h' },
-                { label: 'Fat Burning 12h+', start: '12h', end: '18h' },
-                { label: 'Ketosis 18h+', start: '18h', end: '24h' },
-                { label: 'Autophagy 24h+', start: '24h', end: '36h' },
-              ].map((stageItem) => (
-                <div key={stageItem.label} className="stage-item">
-                  <span className="stage-dot" />
-                  <div>
-                    <strong>{stageItem.label}</strong>
-                    <small>{stageItem.start} → {stageItem.end}</small>
-                  </div>
-                </div>
+              {fastingStages.map((stage, index) => (
+                <button type="button" key={stage.key} className={`stage-item ${(selectedStage?.key === stage.key ? 'selected' : '')} ${activeFast && index === activeStageIndex ? 'live' : ''}`} onClick={() => setSelectedStageKey(stage.key)}>
+                  <span className="stage-dot" style={{ background: stage.color }} />
+                  <span><strong>{stage.label}</strong><small>{stage.range}</small></span>
+                </button>
               ))}
             </div>
           </div>
+
+          <article className="fasting-insight-card">
+            <div className="insight-card-heading">
+              <div><p className="eyebrow">{activeFast ? 'LIVE PHYSIOLOGY' : 'PHASE PREVIEW'}</p><h3>{selectedStage.label}</h3></div>
+              <span className="phase-range">{selectedStage.range}</span>
+            </div>
+            <div className="insight-grid">
+              <div><strong>Hormonal profile</strong><p>{selectedStage.hormones}</p></div>
+              <div><strong>Primary fuel</strong><p>{selectedStage.fuel}</p></div>
+              <div><strong>Mind & focus</strong><p>{selectedStage.focus}</p></div>
+              <div><strong>Biological events</strong><p>{selectedStage.events}</p></div>
+            </div>
+            <div className="insight-benefit"><strong>Why it matters long term</strong><p>{selectedStage.benefits}</p></div>
+          </article>
         </div>
 
         <div className="panel-card log-panel">
@@ -2913,6 +3348,24 @@ function FastingView({ user, updateUser, setToast }) {
             ))}
           </div>
         </div>
+
+        {startEditorOpen && (
+          <div className="modal-backdrop" onClick={() => setStartEditorOpen(false)}>
+            <div className="modal-card start-time-modal" onClick={(event) => event.stopPropagation()}>
+              <p className="eyebrow">ACTIVE FAST</p>
+              <h3>Update Start Date &amp; Time</h3>
+              <p>Elapsed time, progress, phase, and projected ending will update from this timestamp.</p>
+              <label className="field-label">
+                Fast started
+                <input type="datetime-local" step="1" value={startEditorValue} max={toLocalDateTimeValue(new Date())} onChange={(event) => setStartEditorValue(event.target.value)} autoFocus />
+              </label>
+              <div className="routine-actions-row">
+                <button type="button" className="ghost-button" onClick={() => setStartEditorOpen(false)}>Cancel</button>
+                <button type="button" className="primary-button" onClick={saveStartTime}><Save size={14} /> Update start</button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </>
   )
@@ -3005,7 +3458,7 @@ function WorkoutSessionEditor({ session, exerciseLibrary = exercisesSeed, onClos
                 <div className={`session-set-row ${set.completed ? 'completed' : ''}`} key={setIndex}>
                   <span>Set {setIndex + 1}</span>
                   {exercise.trackingType === 'duration' ? <><input value={set.duration || ''} onChange={(event) => updateSet(exerciseIndex, setIndex, 'duration', event.target.value)} placeholder="MM:SS" /><input value={set.distance || ''} onChange={(event) => updateSet(exerciseIndex, setIndex, 'distance', event.target.value)} placeholder="km" /></> : <><input type="number" value={set.reps ?? ''} onChange={(event) => updateSet(exerciseIndex, setIndex, 'reps', event.target.value)} placeholder="reps" /><input type="number" value={set.weight ?? ''} onChange={(event) => updateSet(exerciseIndex, setIndex, 'weight', event.target.value)} placeholder="kg" /></>}
-                  <button className={`exercise-complete-toggle ${set.completed ? 'done' : ''}`} onClick={() => updateSet(exerciseIndex, setIndex, 'completed', !set.completed)}>{set.completed ? '✓ Done' : 'Not Done'}</button>
+                  <button className={`exercise-complete-toggle ${set.completed ? 'done' : ''}`} onClick={() => updateSet(exerciseIndex, setIndex, 'completed', !set.completed)}>{set.completed ? 'Done' : 'Not Done'}</button>
                   <button className="icon-button subtle" onClick={() => updateExercises((items) => items.map((item, index) => index !== exerciseIndex ? item : { ...item, sets: item.sets.filter((_, indexInExercise) => indexInExercise !== setIndex) }))} aria-label="Remove set"><Trash2 size={13} /></button>
                 </div>
               ))}
@@ -3061,7 +3514,7 @@ function LogHistoryView({ user, updateUser, setToast }) {
   const workoutLogs = (user.workoutSessions || []).map((session) => ({
     id: `session-${session.id}`,
     type: 'Workout',
-    icon: '🏋️',
+    icon: user.routines.find((routine) => routine.id === session.routineId)?.exerciseEmoji || user.exerciseEmoji || '🏋️',
     title: session.routineName,
     date: session.endedAt || session.startedAt,
     summary: `${Math.max(1, Math.round((session.durationMinutes || session.durationMs / 60000) || 1))} min • ${session.routineName}`,
@@ -3105,7 +3558,7 @@ function LogHistoryView({ user, updateUser, setToast }) {
           <article key={entry.id} className="log-item">
             <div className="log-header">
               <div className="log-type">
-                <span>{entry.icon}</span>
+                {entry.type !== 'Workout' && <span>{entry.icon}</span>}
                 <div>
                   <strong>{entry.title || entry.type}</strong>
                   <small>{entry.type}</small>
@@ -3562,7 +4015,7 @@ function GratefulView({ user, updateUser, setToast }) {
   )
 }
 
-function SettingsView({ user, updateUser, setToast }) {
+function SettingsView({ user, updateUser, setToast, onSignOutAll }) {
   const [form, setForm] = useState({
     name: user.name,
     theme: user.theme || 'light',
@@ -3594,9 +4047,17 @@ function SettingsView({ user, updateUser, setToast }) {
 
           <label className="field-label">
             Theme
-            <select value={form.theme} onChange={(event) => setForm({ ...form, theme: event.target.value })}>
-              <option value="light">Pastel light</option>
-              <option value="dark">Midnight dark</option>
+            <select value={form.theme} onChange={(event) => {
+              const theme = event.target.value
+              setForm((current) => ({ ...current, theme }))
+              updateUser({ theme })
+              setToast(`${theme === 'dark' ? 'Dark' : 'Light'} mode enabled`)
+            }}>
+              <option value="light">Pastel Light</option>
+              <option value="dark">Midnight Dark</option>
+              <option value="ocean">Ocean Breeze</option>
+              <option value="forest">Forest Calm</option>
+              <option value="sunset">Sunset Bloom</option>
             </select>
           </label>
 
@@ -3605,6 +4066,22 @@ function SettingsView({ user, updateUser, setToast }) {
             Save profile
           </button>
         </div>
+
+        {!user.guest && onSignOutAll && (
+          <div className="panel-card settings-card">
+            <p className="eyebrow">SECURITY</p>
+            <h3>Active sessions</h3>
+            <p>Sign out FitLife on every device connected to this account.</p>
+            <button className="secondary-button" onClick={async () => {
+              const { error } = await onSignOutAll()
+              if (error) setToast(error.message)
+              else setToast('Signed out on all devices')
+            }}>
+              <LogOut size={16} />
+              Sign out everywhere
+            </button>
+          </div>
+        )}
 
         <div className="panel-card settings-card">
           <p className="eyebrow">STAYING WITH IT</p>
