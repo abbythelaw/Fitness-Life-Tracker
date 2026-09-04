@@ -817,6 +817,9 @@ function FocusForToday({ metrics, habits }) {
         tone: 'neutral',
         title: 'Add a Sleep metric to unlock recovery insights',
         detail: 'Log nightly sleep hours or score as a custom metric so we can track your 7-day trend.',
+        stat: '--',
+        unit: '',
+        barPercent: null,
       }
     }
     const entryByDay = new Map((sleepMetric.entries || []).map((entry) => [formatDayKey(entry.date), Number(entry.value) || 0]))
@@ -826,20 +829,32 @@ function FocusForToday({ metrics, habits }) {
     const priorValues = priorDays.map((day) => entryByDay.get(day)).filter((value) => value !== undefined)
     const recentAvg = average(recentValues)
     const priorAvg = average(priorValues)
+    const unit = sleepMetric.unit || ''
+    // Reference scale for the mini bar — the metric's own target, or a sensible sleep-hours default.
+    const scale = Number(sleepMetric.target) || 8
 
     if (recentAvg === null) {
       return {
         tone: 'neutral',
         title: `No ${sleepMetric.name.toLowerCase()} logged this week`,
         detail: 'Log a value for the last 7 days to see your recovery trend here.',
+        stat: '--',
+        unit,
+        barPercent: null,
       }
     }
+
+    const stat = recentAvg.toFixed(1)
+    const barPercent = Math.max(4, Math.min(100, Math.round((recentAvg / scale) * 100)))
 
     if (priorAvg === null || priorAvg === 0) {
       return {
         tone: 'good',
-        title: `${sleepMetric.name} averaging ${recentAvg.toFixed(1)} ${sleepMetric.unit || ''}`.trim(),
+        title: `${sleepMetric.name} averaging ${stat} ${unit}`.trim(),
         detail: 'Keep logging daily so we can compare week-over-week trends.',
+        stat,
+        unit,
+        barPercent,
       }
     }
 
@@ -849,6 +864,9 @@ function FocusForToday({ metrics, habits }) {
         tone: 'alert',
         title: `Sleep score dropped ${Math.abs(pctChange)}% this week`,
         detail: 'Prioritize recovery today — earlier bedtime, hydration, and a lighter training load.',
+        stat,
+        unit,
+        barPercent,
       }
     }
     if (pctChange >= 10) {
@@ -856,12 +874,18 @@ function FocusForToday({ metrics, habits }) {
         tone: 'good',
         title: `Sleep score improved ${pctChange}% this week`,
         detail: 'Recovery is trending up — a great day to push intensity if you feel ready.',
+        stat,
+        unit,
+        barPercent,
       }
     }
     return {
       tone: 'neutral',
-      title: `Sleep score steady at ${recentAvg.toFixed(1)} ${sleepMetric.unit || ''}`.trim(),
+      title: `Sleep score steady at ${stat} ${unit}`.trim(),
       detail: 'No major shift this week — maintain your current recovery routine.',
+      stat,
+      unit,
+      barPercent,
     }
   })()
 
@@ -871,6 +895,8 @@ function FocusForToday({ metrics, habits }) {
         tone: 'neutral',
         title: 'No habits set up yet',
         detail: 'Add a habit to start tracking your daily completion rate.',
+        rate: 0,
+        delta: null,
       }
     }
     const todayKey = todayValue()
@@ -892,6 +918,8 @@ function FocusForToday({ metrics, habits }) {
         tone: 'neutral',
         title: `${doneToday}/${activeToday.length} habits completed today (${todayRate}%)`,
         detail: 'Keep logging daily to build a historical average for comparison.',
+        rate: todayRate,
+        delta: null,
       }
     }
 
@@ -901,6 +929,8 @@ function FocusForToday({ metrics, habits }) {
         tone: 'alert',
         title: `Habit completion is ${Math.abs(delta)}% below your average today`,
         detail: `You're at ${todayRate}% vs a ${Math.round(historicalAvg)}% 30-day average — knock out one more habit to catch up.`,
+        rate: todayRate,
+        delta,
       }
     }
     if (delta >= 15) {
@@ -908,12 +938,16 @@ function FocusForToday({ metrics, habits }) {
         tone: 'good',
         title: `Habit completion is ${delta}% above your average today`,
         detail: `${todayRate}% completed vs your usual ${Math.round(historicalAvg)}% — great consistency.`,
+        rate: todayRate,
+        delta,
       }
     }
     return {
       tone: 'neutral',
       title: `${doneToday}/${activeToday.length} habits completed today (${todayRate}%)`,
       detail: `In line with your ${Math.round(historicalAvg)}% 30-day average.`,
+      rate: todayRate,
+      delta,
     }
   })()
 
@@ -926,16 +960,62 @@ function FocusForToday({ metrics, habits }) {
       <div className="focus-today-grid">
         <article className={`focus-today-card tone-${sleepInsight.tone}`}>
           <span className="focus-today-label">Sleep quality</span>
-          <strong>{sleepInsight.title}</strong>
+          <div className="focus-stat-row">
+            <strong className="focus-stat-number">
+              {sleepInsight.stat}
+              {sleepInsight.stat !== '--' && sleepInsight.unit && <small className="focus-stat-unit"> {sleepInsight.unit}</small>}
+            </strong>
+            {sleepInsight.barPercent !== null && (
+              <div className="focus-mini-bar-track" aria-hidden="true">
+                <div className={`focus-mini-bar-fill tone-${sleepInsight.tone}`} style={{ width: `${sleepInsight.barPercent}%` }} />
+              </div>
+            )}
+          </div>
+          <p className="focus-stat-caption">{sleepInsight.title}</p>
           <p>{sleepInsight.detail}</p>
         </article>
         <article className={`focus-today-card tone-${habitInsight.tone}`}>
           <span className="focus-today-label">Habit completion</span>
-          <strong>{habitInsight.title}</strong>
+          <div className="focus-stat-row">
+            <ProgressRing percent={habitInsight.rate} tone={habitInsight.tone} />
+            {habitInsight.delta !== null && (
+              <span className={`focus-delta-badge tone-${habitInsight.tone}`}>
+                {habitInsight.delta >= 0 ? '+' : ''}{habitInsight.delta}% vs usual
+              </span>
+            )}
+          </div>
+          <p className="focus-stat-caption">{habitInsight.title}</p>
           <p>{habitInsight.detail}</p>
         </article>
       </div>
     </section>
+  )
+}
+
+function ProgressRing({ percent, tone = 'neutral', size = 64, strokeWidth = 7 }) {
+  const radius = (size - strokeWidth) / 2
+  const circumference = 2 * Math.PI * radius
+  const clamped = Math.max(0, Math.min(100, percent))
+  const offset = circumference * (1 - clamped / 100)
+  const toneColor = tone === 'alert' ? 'var(--accent-crimson)' : tone === 'good' ? 'var(--accent-primary)' : 'var(--accent-yellow)'
+
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="focus-ring" role="img" aria-label={`${Math.round(clamped)}% completed`}>
+      <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="var(--line)" strokeWidth={strokeWidth} />
+      <circle
+        cx={size / 2}
+        cy={size / 2}
+        r={radius}
+        fill="none"
+        stroke={toneColor}
+        strokeWidth={strokeWidth}
+        strokeDasharray={circumference}
+        strokeDashoffset={offset}
+        strokeLinecap="round"
+        transform={`rotate(-90 ${size / 2} ${size / 2})`}
+      />
+      <text x="50%" y="50%" textAnchor="middle" dominantBaseline="central" className="focus-ring-text">{Math.round(clamped)}%</text>
+    </svg>
   )
 }
 
@@ -1318,10 +1398,10 @@ function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corn
         <span className="heatmap-legend-label">{exactLabel}</span>
       </div>
       <div className="bivariate-diamond-body">
-        <span className="bivariate-axis-label bivariate-axis-top">{corners.top.label}</span>
-        <span className="bivariate-axis-label bivariate-axis-left">{corners.left.label}</span>
-        <span className="bivariate-axis-label bivariate-axis-right">{corners.right.label}</span>
-        <span className="bivariate-axis-label bivariate-axis-bottom">{corners.bottom.label}</span>
+        <span className="bivariate-axis-label bivariate-axis-top" aria-hidden="true">↑</span>
+        <span className="bivariate-axis-label bivariate-axis-left" aria-hidden="true">←</span>
+        <span className="bivariate-axis-label bivariate-axis-right" aria-hidden="true">→</span>
+        <span className="bivariate-axis-label bivariate-axis-bottom" aria-hidden="true">↓</span>
         <div className="bivariate-diamond-wrap">
           <div className="bivariate-diamond-grid" style={{ gridTemplateColumns: `repeat(${gridSize}, 1fr)`, gridTemplateRows: `repeat(${gridSize}, 1fr)` }}>
             {cells.map((cell) => (
@@ -1347,7 +1427,9 @@ function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corn
       </div>
       <div className="bivariate-axis-caption"><span>{yLabel} ↕</span><span>{xLabel} ↔</span></div>
       <div className="bivariate-info-panel">
-        <strong style={{ color: displayCorner.color }}>{displayCorner.label}</strong>
+        <span className="bivariate-active-badge" style={{ '--badge-color': displayCorner.color }}>
+          <Sparkles size={12} /> {displayCorner.label}
+        </span>
         <p>{displayCorner.advice}</p>
       </div>
     </article>
