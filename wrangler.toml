@@ -1,7 +1,7 @@
-compatibility_date = "2026-09-02"
-
 name = "fitness-life-tracker"
 pages_build_output_dir = "dist"
+compatibility_date = "2026-09-02"
 
+[vars]
 VITE_SUPABASE_URL = "https://hfaeleirzzwxikfgmjag.supabase.co"
 VITE_SUPABASE_ANON_KEY = "sbp_2bc637750c72d7b3911c3ab966e665a16d0aa483"
