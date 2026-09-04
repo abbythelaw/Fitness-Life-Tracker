@@ -1573,7 +1573,6 @@ function SnapshotHeatmaps({ user }) {
         />
       </div>
 
-      <HabitContributionHeatmap habits={user.habits || []} />
     </section>
   )
 }
@@ -1604,77 +1603,26 @@ function ExploreDataQuickNav({ setView }) {
   )
 }
 
-function HabitContributionHeatmap({ habits }) {
-  const [selectedDay, setSelectedDay] = useState(null)
-  const days = Array.from({ length: 35 }, (_, index) => {
-    const date = new Date()
-    date.setDate(date.getDate() - (34 - index))
-    return { key: formatDayKey(date), date }
-  })
-
-  const daysWithStats = days.map(({ key, date }) => {
-    const activeHabits = habits.filter((habit) => !(habit.restDay && date.getDay() === 0))
-    const doneHabits = activeHabits.filter((habit) => (habit.logs || []).some((entry) => entry.date === key && entry.done))
-    const completion = activeHabits.length ? Math.round((doneHabits.length / activeHabits.length) * 100) : 0
-    const names = doneHabits.map((habit) => habit.name)
-    return { key, completion, names, total: activeHabits.length }
-  })
-
-  const selected = selectedDay ? daysWithStats.find((item) => item.key === selectedDay) : null
-
-  return (
-    <section className="habit-heatmap-panel panel-card">
-      <div className="activity-heatmap-heading">
-        <div>
-          <p className="eyebrow">HABITS TRACKING</p>
-          <h3>Contribution calendar</h3>
-        </div>
-        <span className="heatmap-legend-label">Last 35 days</span>
-      </div>
-
-      <div className="habit-heatmap-grid" role="grid" aria-label="Habit activity heatmap">
-        {daysWithStats.map((day) => {
-          const fill = day.completion <= 0 ? '#1E293B' : mixHexColors('#00E5FF', '#1E293B', 1 - day.completion / 100)
-          return (
-            <button
-              key={day.key}
-              type="button"
-              className="habit-heatmap-tile"
-              style={{ background: fill }}
-              aria-label={`${day.key}: ${day.completion}% completion`}
-              title={`${day.key}: ${day.completion}% completion`}
-              onClick={() => setSelectedDay(day.key)}
-            />
-          )
-        })}
-      </div>
-
-      {selected && (
-        <div className="habit-popover">
-          <strong>{formatDateLabel(selected.key)}</strong>
-          <p>{selected.completion}% complete • {selected.names.length}/{selected.total} habits done</p>
-          <div className="habit-popover-list">
-            {selected.names.length ? selected.names.map((name) => <span key={name}>{name}</span>) : <span>No habits completed</span>}
-          </div>
-        </div>
-      )}
-    </section>
-  )
-}
-
 function HabitMiniHeatmapCard({ habit, updateUser, user, setToast }) {
   const [selectedDay, setSelectedDay] = useState(null)
   const todayKey = todayValue()
   const now = new Date()
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1)
-  const monthOffset = (monthStart.getDay() + 6) % 7
-  const calendarStart = new Date(monthStart)
-  calendarStart.setDate(calendarStart.getDate() - monthOffset)
+  const calendarStart = new Date(now)
+  calendarStart.setDate(now.getDate() - now.getDay() - (7 * 11))
 
-  const days = Array.from({ length: 35 }, (_, index) => {
+  const days = Array.from({ length: 84 }, (_, index) => {
     const date = new Date(calendarStart)
     date.setDate(calendarStart.getDate() + index)
     return { key: formatDayKey(date), date }
+  })
+  const monthLabels = Array.from({ length: 12 }, (_, index) => {
+    const date = new Date(calendarStart)
+    date.setDate(calendarStart.getDate() + (index * 7))
+    const previousDate = new Date(date)
+    previousDate.setDate(date.getDate() - 7)
+    return date.getMonth() !== previousDate.getMonth() || index === 0
+      ? date.toLocaleDateString(undefined, { month: 'short' })
+      : ''
   })
 
   const entries = new Map((habit.logs || []).map((entry) => [entry.date, entry]))
@@ -1710,8 +1658,19 @@ function HabitMiniHeatmapCard({ habit, updateUser, user, setToast }) {
         </div>
       </div>
 
-      <div className="habit-mini-grid">
-        {days.map(({ key, date }) => {
+      <div className="habit-mini-calendar">
+        <div className="habit-mini-months" aria-hidden="true">
+          {monthLabels.map((label, index) => <span key={`month-${index}`}>{label}</span>)}
+        </div>
+        <div className="habit-mini-calendar-body">
+          <div className="habit-mini-weekdays" aria-hidden="true">
+            <span />
+            <span>M</span><span />
+            <span>W</span><span />
+            <span>F</span><span />
+          </div>
+          <div className="habit-mini-grid" role="grid" aria-label={`${habit.name} contribution calendar`}>
+            {days.map(({ key, date }) => {
           const entry = entries.get(key)
           const done = entry?.done
           const isFuture = key > todayKey
@@ -1727,7 +1686,9 @@ function HabitMiniHeatmapCard({ habit, updateUser, user, setToast }) {
               onClick={() => setSelectedDay(key)}
             />
           )
-        })}
+            })}
+          </div>
+        </div>
       </div>
 
       <div className="habit-mini-footer">
@@ -1762,8 +1723,8 @@ function Snapshot({ user, updateUser, setToast, setView }) {
       <section className="habit-mini-grid-wrap">
         <div className="overview-head">
           <div>
-            <h2>Habit tracker cards</h2>
-            <p>Individual mini heatmaps for each tracked habit.</p>
+            <h2>Habit contributions</h2>
+            <p>Each habit, tracked day by day.</p>
           </div>
         </div>
         <div className="habit-mini-grid-list">
@@ -2135,24 +2096,21 @@ function HealthMetricsView({ user, updateUser, setToast }) {
                 )}
 
                 <div className="calendar-strip">
-                  <div className="mini-weekday-row compact-row">
-                    {['M', 'T', 'W', 'Th', 'F', 'S', 'S'].map((label) => (
-                      <span key={`${metric.id}-weekday-${label}`}>{label}</span>
-                    ))}
-                  </div>
-                  <div className="metric-heatmap" aria-label={`${metric.name} activity heatmap`}>
-                    {heatmap.map((day) => (
-                      <span
-                        key={`${metric.id}-${day.key}`}
-                        className={`metric-square intensity-${day.intensity} ${day.isToday ? 'today' : ''}`}
-                        title={`${day.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}: ${day.value === null ? 'No data' : getEntryValue(metric, { value: day.value, date: day.key })}`}
-                      >
-                        <span className="metric-date-stack">
-                          <small>{new Intl.DateTimeFormat('en-US', { month: 'short' }).format(day.date).toUpperCase()}</small>
-                          <strong>{day.date.getDate()}</strong>
-                        </span>
-                      </span>
-                    ))}
+                  <div className="metric-mini-calendar-body">
+                    <div className="metric-mini-weekdays" aria-hidden="true">
+                      {['M', 'T', 'W', 'Th', 'F', 'S', 'S'].map((label) => (
+                        <span key={`${metric.id}-weekday-${label}`}>{label}</span>
+                      ))}
+                    </div>
+                    <div className="metric-heatmap" aria-label={`${metric.name} activity heatmap`}>
+                      {heatmap.map((day) => (
+                        <span
+                          key={`${metric.id}-${day.key}`}
+                          className={`metric-square intensity-${day.intensity} ${day.isToday ? 'today' : ''}`}
+                          title={`${day.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}: ${day.value === null ? 'No data' : getEntryValue(metric, { value: day.value, date: day.key })}`}
+                        />
+                      ))}
+                    </div>
                   </div>
                 </div>
 
@@ -2352,24 +2310,21 @@ function HealthMetricsView({ user, updateUser, setToast }) {
             </div>
 
             <div className="calendar-strip expanded-calendar">
-              <div className="mini-weekday-row compact-row">
-                {['M', 'T', 'W', 'Th', 'F', 'S', 'S'].map((label) => (
-                  <span key={`${selectedMetric.id}-weekday-${label}`}>{label}</span>
-                ))}
-              </div>
-              <div className="metric-detail-grid">
-                {getMetricHeatmap(selectedMetric).map((day) => (
-                  <span
-                    key={`${selectedMetric.id}-${day.key}`}
-                    className={`metric-square intensity-${day.intensity} ${day.isToday ? 'today' : ''}`}
-                    title={`${day.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`}
-                  >
-                    <span className="metric-date-stack">
-                      <small>{new Intl.DateTimeFormat('en-US', { month: 'short' }).format(day.date).toUpperCase()}</small>
-                      <strong>{day.date.getDate()}</strong>
-                    </span>
-                  </span>
-                ))}
+              <div className="metric-mini-calendar-body large">
+                <div className="metric-mini-weekdays large" aria-hidden="true">
+                  {['M', 'T', 'W', 'Th', 'F', 'S', 'S'].map((label) => (
+                    <span key={`${selectedMetric.id}-weekday-${label}`}>{label}</span>
+                  ))}
+                </div>
+                <div className="metric-detail-grid">
+                  {getMetricHeatmap(selectedMetric).map((day) => (
+                    <span
+                      key={`${selectedMetric.id}-${day.key}`}
+                      className={`metric-square intensity-${day.intensity} ${day.isToday ? 'today' : ''}`}
+                      title={`${day.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`}
+                    />
+                  ))}
+                </div>
               </div>
             </div>
 
@@ -2451,6 +2406,7 @@ function ExercisesView({ user, updateUser, setToast }) {
 
   const [draft, setDraft] = useState(emptyRoutine())
   const [editingId, setEditingId] = useState(null)
+  const [showRoutineForm, setShowRoutineForm] = useState(false)
   const [exerciseForm, setExerciseForm] = useState(emptyExercise())
   const [editingExerciseId, setEditingExerciseId] = useState(null)
   const [deleteTarget, setDeleteTarget] = useState(null)
@@ -2968,16 +2924,20 @@ function ExercisesView({ user, updateUser, setToast }) {
           <h2>Exercise routines</h2>
           <p>Build focused plans you can reuse, edit, and save.</p>
         </div>
+        <button className="primary-button" onClick={() => setShowRoutineForm(true)}>
+          <Plus size={15} />
+          Add a new routine
+        </button>
       </section>
 
-
-      <div className="panel-card routine-builder">
+      {showRoutineForm && <div className="modal-backdrop form-toggle-backdrop" onClick={() => { setDraft(emptyRoutine()); setEditingId(null); setShowRoutineForm(false) }}>
+      <div className="panel-card form-popout routine-builder" onClick={(event) => event.stopPropagation()}>
         <div className="panel-heading compact">
           <div>
             <p className="eyebrow">{editingId ? 'EDIT ROUTINE' : 'NEW ROUTINE'}</p>
             <h3>{editingId ? 'Update your workout plan' : 'Create a workout plan'}</h3>
           </div>
-          <button className="ghost-button" onClick={() => { setDraft(emptyRoutine()); setEditingId(null) }}>
+          <button className="ghost-button" onClick={() => { setDraft(emptyRoutine()); setEditingId(null); setShowRoutineForm(false) }}>
             <X size={16} />
             Reset
           </button>
@@ -3015,6 +2975,7 @@ function ExercisesView({ user, updateUser, setToast }) {
           </button>
         </div>
       </div>
+      </div>}
 
       <div className="routine-grid">
         {user.routines.map((routine) => {
@@ -3342,8 +3303,10 @@ function HabitView({ user, updateUser, setToast }) {
     restDay: false,
     trackingType: 'boolean',
     targetValue: '',
+    quickLog: false,
   })
   const [editingId, setEditingId] = useState(null)
+  const [showForm, setShowForm] = useState(false)
   const [selectedHabitId, setSelectedHabitId] = useState(user.habits?.[0]?.id ?? null)
   const [customCategory, setCustomCategory] = useState('')
   const [loggingHabit, setLoggingHabit] = useState(null)
@@ -3352,9 +3315,10 @@ function HabitView({ user, updateUser, setToast }) {
   const categoryOptions = [...new Set([...habitCategories, ...user.habits.map((habit) => habit.category).filter(Boolean)])]
 
   const resetForm = () => {
-    setForm({ id: uid(), name: '', category: 'Movement', measurementMode: 'binary', target: '', unit: 'minutes', icon: '💪', restDay: false, trackingType: 'boolean', targetValue: '' })
+    setForm({ id: uid(), name: '', category: 'Movement', measurementMode: 'binary', target: '', unit: 'minutes', icon: '💪', restDay: false, trackingType: 'boolean', targetValue: '', quickLog: false })
     setEditingId(null)
     setCustomCategory('')
+    setShowForm(false)
   }
 
   const updateField = (field, value) => {
@@ -3375,6 +3339,7 @@ function HabitView({ user, updateUser, setToast }) {
     }
 
     const nextCategory = customCategory.trim() || form.category || 'Movement'
+    const todayKey = todayValue()
     const normalizedHabit = {
       ...form,
       id: editingId || uid(),
@@ -3385,22 +3350,30 @@ function HabitView({ user, updateUser, setToast }) {
       targetValue: form.measurementMode === 'time' ? form.target || null : Number(form.target) || null,
       unit: form.measurementMode === 'minutes' ? 'minutes' : form.measurementMode === 'kms' ? 'kms' : 'count',
       restDay: !!form.restDay,
-      logs: user.habits.find((habit) => habit.id === editingId)?.logs || [],
+      logs: editingId ? user.habits.find((habit) => habit.id === editingId)?.logs || [] : [],
     }
+
+    const habitToSave = editingId
+      ? normalizedHabit
+      : {
+          ...normalizedHabit,
+          logs: form.quickLog ? [{ id: uid(), date: todayKey, done: true, value: Number(form.target) || 1 }] : [],
+        }
 
     updateUser({
       habits: editingId
-        ? user.habits.map((habit) => (habit.id === editingId ? normalizedHabit : habit))
-        : [...user.habits, normalizedHabit],
+        ? user.habits.map((habit) => (habit.id === editingId ? habitToSave : habit))
+        : [...user.habits, habitToSave],
     })
 
-    setToast(editingId ? 'Habit updated' : 'Habit saved')
+    setToast(editingId ? 'Habit updated' : form.quickLog ? 'Habit saved and logged for today' : 'Habit saved')
     resetForm()
-    setSelectedHabitId(normalizedHabit.id)
+    setSelectedHabitId(habitToSave.id)
   }
 
   const editHabit = (habit) => {
     setEditingId(habit.id)
+    setShowForm(true)
     setForm({
       ...habit,
       target: habit.target ?? '',
@@ -3575,9 +3548,14 @@ function HabitView({ user, updateUser, setToast }) {
           <h2>Habit tracker</h2>
           <p>Track momentum with flexible metrics and streak-friendly structure.</p>
         </div>
+        <button className="primary-button" onClick={() => setShowForm(true)}>
+          <Plus size={15} />
+          Add a new habit
+        </button>
       </section>
 
-      <div className="panel-card habit-form-card">
+      {showForm && <div className="modal-backdrop form-toggle-backdrop" onClick={resetForm}>
+        <div className="panel-card form-popout habit-form-card" onClick={(event) => event.stopPropagation()}>
         <div className="panel-heading compact">
           <div>
             <p className="eyebrow">{editingId ? 'EDIT HABIT' : 'NEW HABIT'}</p>
@@ -3596,6 +3574,16 @@ function HabitView({ user, updateUser, setToast }) {
             <input value={form.name} onChange={(event) => updateField('name', event.target.value)} placeholder="Daily walk / Read 10 pages" />
           </label>
         </div>
+
+        {!editingId && (
+          <button
+            type="button"
+            className={`metric-quick-toggle ${form.quickLog ? 'done' : ''}`}
+            onClick={() => setForm((current) => ({ ...current, quickLog: !current.quickLog }))}
+          >
+            {form.quickLog ? 'Logged for today' : 'Log today'}
+          </button>
+        )}
 
         <div className="field-grid two-up">
           <label className="field-label">
@@ -3663,7 +3651,8 @@ function HabitView({ user, updateUser, setToast }) {
             {editingId ? 'Save habit' : 'Add habit'}
           </button>
         </div>
-      </div>
+        </div>
+      </div>}
 
       <section className="panel-card habit-overview-calendar">
         <div className="panel-heading compact">
