@@ -1250,6 +1250,11 @@ textarea { resize: vertical; min-height: 120px; }
   box-shadow: 0 24px 52px rgba(15, 23, 42, 0.35);
 }
 .metric-modal-card h3, .metric-detail-modal h3 { margin: 8px 0 0; font-size: 24px; }
+html[data-mode='light'] .metric-modal-card,
+html[data-mode='light'] .metric-detail-modal {
+  background: linear-gradient(180deg, #ffffff, #fafbff);
+  box-shadow: 0 24px 52px var(--shadow);
+}
 .metric-modal-header {
   display: flex;
   align-items: flex-start;
@@ -1335,7 +1340,7 @@ textarea { resize: vertical; min-height: 120px; }
   padding: 16px;
   border: 1px solid var(--line);
   border-radius: 14px;
-  background: rgba(255,255,255,0.05);
+  background: var(--control);
 }
 .entry-editor strong { display: block; margin-bottom: 6px; }
 .metric-history-row {
@@ -1584,6 +1589,61 @@ textarea { resize: vertical; min-height: 120px; }
 }
 .workout-history-panel {
   margin-top: 20px;
+}
+.empty-state { padding: 24px; text-align: center; color: var(--muted); }
+.activity-feed {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  margin-top: 20px;
+  width: 100%;
+}
+.activity-card { overflow: hidden; padding: 0; width: 100%; max-width: 100%; }
+.activity-cover {
+  height: 140px;
+  background-size: cover;
+  background-position: center;
+  display: flex;
+  align-items: flex-end;
+  padding: 12px;
+}
+.activity-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #0b0f19;
+}
+.activity-body { padding: 16px 18px 18px; }
+.activity-header-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.activity-header-row strong { display: block; font-size: 15px; }
+.activity-header-row small { color: var(--muted); font-size: 11px; }
+.activity-actions { display: flex; gap: 6px; }
+.activity-stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.activity-stat-row strong { display: block; font-size: 15px; color: var(--text); }
+.activity-notes {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+@media (max-width: 900px) {
+  .activity-feed { grid-template-columns: 1fr; }
 }
 .workout-live-box {
   display: flex;

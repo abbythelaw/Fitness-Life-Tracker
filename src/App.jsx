@@ -17,6 +17,7 @@ import {
   Sparkles,
   TimerReset,
   Trash2,
+  Trophy,
   X,
 } from 'lucide-react'
 import {
@@ -97,6 +98,13 @@ const inputToDurationMs = (value) => {
 }
 
 const addMinutes = (date, minutes) => new Date(date.getTime() + minutes * 60000)
+
+const formatPace = (minutesPerKm) => {
+  if (!Number.isFinite(minutesPerKm) || minutesPerKm <= 0) return '0:00'
+  const minutes = Math.floor(minutesPerKm)
+  const seconds = Math.round((minutesPerKm - minutes) * 60)
+  return `${minutes}:${String(seconds).padStart(2, '0')}`
+}
 
 const todayValue = (date = new Date()) => {
   const value = new Date(date)
@@ -368,7 +376,7 @@ const seedUser = (email, name = 'Alex Smith', guest = false) => ({
 const initialUsers = read('fitlife-users', null) || {
   'alex@fitlife.app': { ...seedUser('alex@fitlife.app'), exerciseLibrary: [...exercisesSeed], exercises: [...exercisesSeed] },
 }
-const nav = [['Snapshot', CircleGauge], ['Exercises', Dumbbell], ['Habits', Activity], ['Fasting', TimerReset], ['Log History', NotebookPen], ['Grateful', NotebookPen], ['Settings', Settings]]
+const nav = [['Snapshot', CircleGauge], ['Exercises', Dumbbell], ['Sports', Trophy], ['Habits', Activity], ['Fasting', TimerReset], ['Log History', NotebookPen], ['Grateful', NotebookPen], ['Settings', Settings]]
 
 function App() {
   const [users, setUsers] = useState(initialUsers)
@@ -668,6 +676,7 @@ function App() {
 
         {view === 'Snapshot' && <Snapshot user={user} updateUser={updateUser} setToast={setToast} />}
         {view === 'Exercises' && <ExercisesView user={user} updateUser={updateUser} setToast={setToast} />}
+        {view === 'Sports' && <SportsHubView user={user} updateUser={updateUser} setToast={setToast} />}
         {view === 'Habits' && <HabitView user={user} updateUser={updateUser} setToast={setToast} />}
         {view === 'Fasting' && <FastingView user={user} updateUser={updateUser} setToast={setToast} />}
         {view === 'Log History' && <LogHistoryView user={user} updateUser={updateUser} setToast={setToast} />}
@@ -3811,6 +3820,307 @@ function WorkoutSessionEditor({ session, exerciseLibrary = exercisesSeed, onClos
         <div className="routine-actions-row"><button className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" onClick={save}><Save size={14} /> Save session</button></div>
       </section>
     </div>
+  )
+}
+
+const ACTIVITY_CATEGORIES = [
+  { key: 'running', label: 'Running / Trail', color: '#FF5722', emoji: '🏃' },
+  { key: 'cycling', label: 'Cycling', color: '#FFC107', emoji: '🚴' },
+  { key: 'swimming', label: 'Swimming', color: '#00BCD4', emoji: '🏊' },
+  { key: 'strength', label: 'Strength & Sports', color: '#9C27B0', emoji: '🏋️' },
+]
+
+const ACTIVITY_COVER_PRESETS = [
+  'linear-gradient(135deg, #FF5722, #FF9800)',
+  'linear-gradient(135deg, #FFC107, #FFEB3B)',
+  'linear-gradient(135deg, #00BCD4, #26C6DA)',
+  'linear-gradient(135deg, #9C27B0, #E040FB)',
+  'linear-gradient(135deg, #00F0FF, #00B8CC)',
+  'linear-gradient(135deg, #10B981, #00FF66)',
+]
+
+const getActivityCategory = (key) => ACTIVITY_CATEGORIES.find((category) => category.key === key) || ACTIVITY_CATEGORIES[3]
+
+const emptyActivityForm = () => ({
+  id: null,
+  logId: null,
+  routineName: '',
+  category: 'strength',
+  endedAt: toLocalDateTimeValue(new Date()),
+  durationMinutes: '',
+  distanceKm: '',
+  calories: '',
+  avgHeartRate: '',
+  notes: '',
+  coverImage: '',
+  coverPreset: 0,
+})
+
+function SportsHubView({ user, updateUser, setToast }) {
+  const sessions = user.workoutSessions || []
+  const [modalOpen, setModalOpen] = useState(false)
+  const [form, setForm] = useState(emptyActivityForm())
+  const [deleteTarget, setDeleteTarget] = useState(null)
+  const coverInputRef = useRef(null)
+
+  const openLogModal = () => {
+    setForm(emptyActivityForm())
+    setModalOpen(true)
+  }
+
+  const openEditModal = (session) => {
+    setForm({
+      id: session.id,
+      logId: session.logId || null,
+      routineName: session.routineName || '',
+      category: session.category || 'strength',
+      endedAt: toLocalDateTimeValue(new Date(session.endedAt || Date.now())),
+      durationMinutes: session.durationMinutes || '',
+      distanceKm: session.distanceKm || '',
+      calories: session.calories || '',
+      avgHeartRate: session.avgHeartRate || '',
+      notes: session.notes || '',
+      coverImage: session.coverImage || '',
+      coverPreset: session.coverPreset || 0,
+    })
+    setModalOpen(true)
+  }
+
+  const handleCoverPick = (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (!file.type.startsWith('image/')) {
+      setToast('Please choose an image file.')
+      return
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      setToast('Image is too large (max 2MB).')
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => setForm((current) => ({ ...current, coverImage: String(reader.result || '') }))
+    reader.readAsDataURL(file)
+  }
+
+  const handleSave = () => {
+    const name = form.routineName.trim()
+    if (!name) {
+      setToast('Give this activity a name.')
+      return
+    }
+
+    const endedAt = new Date(form.endedAt).toISOString()
+    const durationMinutes = Math.max(1, Number(form.durationMinutes) || 0)
+    const session = {
+      id: form.id || uid(),
+      logId: form.logId || uid(),
+      routineId: null,
+      routineName: name,
+      category: form.category,
+      startedAt: endedAt,
+      endedAt,
+      durationMinutes,
+      durationMs: durationMinutes * 60000,
+      distanceKm: Number(form.distanceKm) || 0,
+      calories: Number(form.calories) || 0,
+      avgHeartRate: Number(form.avgHeartRate) || 0,
+      notes: form.notes.trim(),
+      coverImage: form.coverImage,
+      coverPreset: form.coverPreset,
+      exercises: sessions.find((item) => item.id === form.id)?.exercises || [],
+    }
+
+    const isEdit = sessions.some((item) => item.id === session.id)
+    const nextSessions = isEdit
+      ? sessions.map((item) => (item.id === session.id ? session : item))
+      : [session, ...sessions]
+
+    const category = getActivityCategory(session.category)
+    const logEntry = {
+      id: session.logId,
+      type: 'Workout',
+      icon: category.emoji,
+      title: session.routineName,
+      date: session.endedAt,
+      summary: `${session.durationMinutes} min • ${category.label}`,
+      archived: false,
+    }
+    const nextLogs = isEdit
+      ? (user.logs || []).map((entry) => (entry.id === session.logId ? logEntry : entry))
+      : [logEntry, ...(user.logs || [])]
+
+    updateUser({ workoutSessions: nextSessions, logs: nextLogs })
+    setModalOpen(false)
+    setToast(isEdit ? 'Activity updated' : 'Activity logged')
+  }
+
+  const confirmDelete = () => {
+    if (!deleteTarget) return
+    updateUser({
+      workoutSessions: sessions.filter((item) => item.id !== deleteTarget.id),
+      logs: (user.logs || []).filter((entry) => entry.id !== deleteTarget.logId),
+    })
+    setDeleteTarget(null)
+    setToast('Activity removed')
+  }
+
+  return (
+    <>
+      <section className="overview-head">
+        <div>
+          <h2>Sports & workouts</h2>
+          <p>Every session, one visual feed.</p>
+        </div>
+        <button className="primary-button" onClick={openLogModal}>
+          <Plus size={15} />
+          Log activity
+        </button>
+      </section>
+
+      <div className="activity-feed">
+        {!sessions.length && <p className="empty-state">No activities logged yet. Tap "Log activity" to add your first session.</p>}
+        {sessions.map((session) => {
+          const category = getActivityCategory(session.category)
+          const distanceKm = Number(session.distanceKm) || 0
+          const durationMinutes = Number(session.durationMinutes) || Math.max(1, Math.round((session.durationMs || 0) / 60000))
+          const paceLabel = distanceKm > 0 ? `${formatPace(durationMinutes / distanceKm)}/km` : null
+
+          return (
+            <article key={session.id} className="activity-card panel-card">
+              <div
+                className="activity-cover"
+                style={session.coverImage ? { backgroundImage: `url(${session.coverImage})` } : { background: ACTIVITY_COVER_PRESETS[session.coverPreset % ACTIVITY_COVER_PRESETS.length] || ACTIVITY_COVER_PRESETS[0] }}
+              >
+                <span className="activity-badge" style={{ background: category.color }}>{category.emoji} {category.label}</span>
+              </div>
+              <div className="activity-body">
+                <div className="activity-header-row">
+                  <div>
+                    <strong>{session.routineName}</strong>
+                    <small>{formatDateLabel(session.endedAt || session.startedAt)}</small>
+                  </div>
+                  <div className="activity-actions">
+                    <button className="icon-button subtle" onClick={() => openEditModal(session)} aria-label="Edit activity"><Pencil size={13} /></button>
+                    <button className="icon-button subtle delete-session-button" onClick={() => setDeleteTarget(session)} aria-label="Delete activity"><Trash2 size={13} /></button>
+                  </div>
+                </div>
+                <div className="activity-stat-row">
+                  <span><strong>{durationMinutes}</strong>min</span>
+                  {distanceKm > 0 && <span><strong>{distanceKm}</strong>km</span>}
+                  {paceLabel && <span><strong>{paceLabel}</strong>pace</span>}
+                  {session.calories > 0 && <span><strong>{session.calories}</strong>kcal</span>}
+                  {session.avgHeartRate > 0 && <span><strong>{session.avgHeartRate}</strong>bpm avg</span>}
+                </div>
+                {session.notes && <p className="activity-notes">{session.notes}</p>}
+              </div>
+            </article>
+          )
+        })}
+      </div>
+
+      {modalOpen && (
+        <div className="modal-backdrop metric-modal-backdrop" onClick={() => setModalOpen(false)}>
+          <div className="metric-modal-card" onClick={(event) => event.stopPropagation()}>
+            <div className="metric-modal-header">
+              <div>
+                <p className="eyebrow">{form.id ? 'EDIT ACTIVITY' : 'LOG ACTIVITY'}</p>
+                <h3>{form.id ? 'Update session' : 'New session'}</h3>
+              </div>
+              <button className="icon-button subtle" onClick={() => setModalOpen(false)} aria-label="Close activity form"><X size={15} /></button>
+            </div>
+
+            <div className="metric-form-grid">
+              <label className="field-label">
+                Activity name
+                <input value={form.routineName} onChange={(event) => setForm({ ...form, routineName: event.target.value })} placeholder="Sunday trail run" />
+              </label>
+
+              <label className="field-label">
+                Category
+                <select value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })}>
+                  {ACTIVITY_CATEGORIES.map((category) => (
+                    <option key={category.key} value={category.key}>{category.emoji} {category.label}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="field-label">
+                Date & time
+                <input type="datetime-local" value={form.endedAt} onChange={(event) => setForm({ ...form, endedAt: event.target.value })} />
+              </label>
+
+              <label className="field-label">
+                Duration (minutes)
+                <input type="number" min="1" value={form.durationMinutes} onChange={(event) => setForm({ ...form, durationMinutes: event.target.value })} />
+              </label>
+
+              <label className="field-label">
+                Distance (km)
+                <input type="number" min="0" step="0.01" value={form.distanceKm} onChange={(event) => setForm({ ...form, distanceKm: event.target.value })} />
+              </label>
+
+              <label className="field-label">
+                Calories
+                <input type="number" min="0" value={form.calories} onChange={(event) => setForm({ ...form, calories: event.target.value })} />
+              </label>
+
+              <label className="field-label">
+                Avg heart rate (bpm)
+                <input type="number" min="0" value={form.avgHeartRate} onChange={(event) => setForm({ ...form, avgHeartRate: event.target.value })} />
+              </label>
+
+              <label className="field-label">
+                Notes / reflection
+                <textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} placeholder="How did it feel?" />
+              </label>
+
+              <div className="field-label">
+                Cover image
+                <div className="color-grid">
+                  {ACTIVITY_COVER_PRESETS.map((preset, index) => (
+                    <button
+                      type="button"
+                      key={preset}
+                      className={`color-dot ${!form.coverImage && form.coverPreset === index ? 'selected' : ''}`}
+                      style={{ background: preset }}
+                      onClick={() => setForm({ ...form, coverPreset: index, coverImage: '' })}
+                      aria-label={`Cover preset ${index + 1}`}
+                    />
+                  ))}
+                </div>
+                <div className="avatar-upload-row">
+                  <button type="button" className="secondary-button" onClick={() => coverInputRef.current?.click()}>Upload photo</button>
+                  {form.coverImage && (
+                    <button type="button" className="ghost-button" onClick={() => setForm({ ...form, coverImage: '' })}>Remove photo</button>
+                  )}
+                  <input ref={coverInputRef} type="file" accept="image/*" hidden onChange={handleCoverPick} />
+                </div>
+              </div>
+            </div>
+
+            <div className="routine-actions-row">
+              <button className="secondary-button" onClick={() => setModalOpen(false)}><X size={15} />Cancel</button>
+              <button className="primary-button" onClick={handleSave}><Save size={15} />Save activity</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deleteTarget && (
+        <div className="modal-backdrop" onClick={() => setDeleteTarget(null)}>
+          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+            <p className="eyebrow">DELETE ACTIVITY</p>
+            <h3>Remove {deleteTarget.routineName}?</h3>
+            <p>This deletes the activity card and its log entry.</p>
+            <div className="routine-actions-row">
+              <button className="secondary-button" onClick={() => setDeleteTarget(null)}>Cancel</button>
+              <button className="primary-button" onClick={confirmDelete}>Confirm delete</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   )
 }
 
