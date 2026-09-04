@@ -360,6 +360,7 @@ function App() {
   const [view, setView] = useState('Snapshot')
   const [mobileNav, setMobileNav] = useState(false)
   const [toast, setToast] = useState('')
+  const [connectionError, setConnectionError] = useState('')
   const [currentTime, setCurrentTime] = useState(new Date())
 
   const user = session ? users[session] : null
@@ -380,9 +381,13 @@ function App() {
 
       setCloudReady(false)
       setSyncState('syncing')
+      setConnectionError('')
       const { data: row, error } = await supabase.from('fitlife_users').select('*').eq('id', authUser.id).maybeSingle()
       if (error) {
-        if (active) setSyncState('offline')
+        if (active) {
+          setSyncState('offline')
+          setConnectionError(`Signed in, but your profile could not load: ${error.message}`)
+        }
         return
       }
 
@@ -391,12 +396,15 @@ function App() {
         seedUser(authUser.id, authUser.user_metadata?.full_name || authUser.email?.split('@')[0] || 'FitLife member'),
       )
       if (!row) {
-        await supabase.from('fitlife_users').insert({
+        const { error: insertError } = await supabase.from('fitlife_users').insert({
           id: authUser.id,
           email: authUser.email,
           data: toCloudProfile(account),
           version: 1,
         })
+        if (insertError && active) {
+          setConnectionError(`Signed in, but your profile could not be created: ${insertError.message}`)
+        }
       }
       if (active) {
         setUsers((all) => ({ ...all, [authUser.id]: account }))
@@ -504,6 +512,7 @@ function App() {
           setUsers((all) => ({ ...all, [account.id]: account }))
           setSession(account.id)
         }}
+          connectionError={connectionError}
           supabaseEnabled={isSupabaseConfigured}
       />
     )
@@ -596,7 +605,7 @@ function App() {
   )
 }
 
-function Auth({ mode, setMode, onAuth, supabaseEnabled }) {
+function Auth({ mode, setMode, onAuth, connectionError, supabaseEnabled }) {
   const [form, setForm] = useState({ name: '', email: '', password: '' })
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
@@ -675,7 +684,7 @@ function Auth({ mode, setMode, onAuth, supabaseEnabled }) {
             <input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="••••••••" />
           </label>
 
-          {error && <p className="error">{error}</p>}
+          {(error || connectionError) && <p className="error">{error || connectionError}</p>}
 
           <button className="primary-button auth-submit" type="submit">
             {loading ? 'Connecting...' : mode === 'login' ? 'Log in' : 'Create account'}

@@ -2,8 +2,15 @@ import { createClient } from '@supabase/supabase-js'
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+const hasSupabaseConfig = Boolean(
+  supabaseUrl
+  && supabaseAnonKey
+  && !supabaseUrl.includes('your_supabase_url_here')
+  && !supabaseAnonKey.includes('your_supabase_anon_key_here')
+  && /^https:\/\/[^/]+\.supabase\.co$/.test(supabaseUrl),
+)
 
-export const supabase = supabaseUrl && supabaseAnonKey
+export const supabase = hasSupabaseConfig
   ? createClient(supabaseUrl, supabaseAnonKey, {
       auth: {
         persistSession: true,
@@ -24,9 +31,9 @@ export const toCloudProfile = (user) => {
 export const fromCloudProfile = (row, fallback = {}) => ({
   ...fallback,
   ...(row?.data || {}),
-  id: row.id,
-  email: row.email,
-  updatedAt: row.updated_at,
+  id: row?.id || fallback.id,
+  email: row?.email || fallback.email,
+  updatedAt: row?.updated_at || fallback.updatedAt,
 })
 
 export const normalizeSupabaseExercise = (exercise) => {
