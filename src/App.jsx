@@ -324,6 +324,21 @@ const seedHealthMetrics = [
   },
 ]
 
+// Maps legacy single `theme` field (light/dark/ocean/forest/sunset) onto the
+// current Forest Calm / Ocean Breeze families, each with a light/dark mode.
+const resolveTheme = (user) => {
+  if (user?.themeFamily && user?.themeMode) return { family: user.themeFamily, mode: user.themeMode }
+  const legacy = user?.theme || 'ocean'
+  const legacyMap = {
+    dark: { family: 'ocean', mode: 'dark' },
+    light: { family: 'ocean', mode: 'light' },
+    ocean: { family: 'ocean', mode: 'light' },
+    forest: { family: 'forest', mode: 'dark' },
+    sunset: { family: 'forest', mode: 'light' },
+  }
+  return legacyMap[legacy] || { family: 'ocean', mode: 'dark' }
+}
+
 const seedUser = (email, name = 'Alex Smith', guest = false) => ({
   id: email,
   email,
@@ -333,6 +348,10 @@ const seedUser = (email, name = 'Alex Smith', guest = false) => ({
   height: 172,
   units: 'kg',
   theme: 'dark',
+  themeFamily: 'ocean',
+  themeMode: 'dark',
+  avatarUrl: '',
+  hiddenMetricIds: [],
   notes: seedNotes,
   routines: seedRoutines,
   exerciseLibrary: exercisesSeed,
@@ -541,11 +560,10 @@ function App() {
   }, [toast])
 
   useEffect(() => {
-    const theme = user?.theme || 'light'
-    document.documentElement.dataset.theme = theme
-    document.documentElement.classList.remove('light', 'dark', 'ocean', 'forest', 'sunset')
-    document.documentElement.classList.add(theme === 'light' ? 'light' : theme === 'dark' ? 'dark' : theme)
-  }, [user?.theme])
+    const { family, mode } = resolveTheme(user)
+    document.documentElement.dataset.theme = family
+    document.documentElement.dataset.mode = mode
+  }, [user?.themeFamily, user?.themeMode, user?.theme])
 
   const updateUser = (patch) => {
     if (!user) return
@@ -586,7 +604,11 @@ function App() {
         </div>
 
         <div className="profile-card">
-          <div className="avatar">{user.name.split(' ').map((part) => part[0]).join('')}</div>
+          {user.avatarUrl ? (
+            <img className="avatar avatar-image" src={user.avatarUrl} alt={user.name} />
+          ) : (
+            <div className="avatar">{user.name.split(' ').map((part) => part[0]).join('')}</div>
+          )}
           <div>
             <strong>{user.name}</strong>
             <small>{user.guest ? 'Guest preview' : syncState === 'synced' ? 'Synced across devices' : syncState}</small>
@@ -906,7 +928,9 @@ function FocusForToday({ metrics, habits }) {
 }
 
 function BulkRecordModal({ user, updateUser, setToast, onClose }) {
-  const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
+  const allMetrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
+  const hiddenMetricIds = user.hiddenMetricIds || []
+  const metrics = allMetrics.filter((metric) => !hiddenMetricIds.includes(metric.id))
   const habits = user.habits || []
   const [dateKey, setDateKey] = useState(todayValue())
   const [metricValues, setMetricValues] = useState({})
@@ -918,7 +942,7 @@ function BulkRecordModal({ user, updateUser, setToast, onClose }) {
   const handleSave = () => {
     let touched = 0
 
-    const nextMetrics = metrics.map((metric) => {
+    const nextMetrics = allMetrics.map((metric) => {
       const raw = metricValues[metric.id]
       if (raw === undefined || raw === '' || raw === false) return metric
       touched += 1
@@ -1022,6 +1046,121 @@ function BulkRecordModal({ user, updateUser, setToast, onClose }) {
         </div>
       </div>
     </div>
+  )
+}
+
+const INSIGHT_GROUPS = ['Physical & Recovery', 'Nutrition & Hydration', 'Mindfulness & Habits']
+
+const classifyMetric = (metric) => {
+  const text = `${metric.category || ''} ${metric.name || ''}`.toLowerCase()
+  if (/protein|water|hydrat|calorie|nutrition|meal|diet/.test(text)) return 'Nutrition & Hydration'
+  if (/meditat|mood|habit|focus|mindful|gratitude/.test(text)) return 'Mindfulness & Habits'
+  return 'Physical & Recovery'
+}
+
+// Merges each metric's recent entries into one date-aligned series, normalized
+// to % of target so wildly different units (bpm, g, hours) can share one chart.
+const buildInsightSeries = (groupMetrics, days = 14) => {
+  const today = new Date()
+  const series = []
+  for (let offset = days - 1; offset >= 0; offset -= 1) {
+    const date = new Date(today.getTime() - offset * 86400000)
+    const key = formatDayKey(date)
+    const point = { date: formatDateLabel(key) }
+    groupMetrics.forEach((metric) => {
+      const entry = (metric.entries || []).find((item) => formatDayKey(item.date) === key)
+      if (!entry) {
+        point[metric.id] = null
+        return
+      }
+      const target = Number(metric.target || 0)
+      if (metric.measurementType === 'boolean') {
+        point[metric.id] = entry.value ? 100 : 0
+      } else if (target > 0) {
+        point[metric.id] = Math.round((Number(entry.value || 0) / target) * 100)
+      } else {
+        point[metric.id] = Number(entry.value || 0)
+      }
+    })
+    series.push(point)
+  }
+  return series
+}
+
+const buildHabitCompletionSeries = (habits, days = 14) => {
+  const today = new Date()
+  const series = []
+  for (let offset = days - 1; offset >= 0; offset -= 1) {
+    const date = new Date(today.getTime() - offset * 86400000)
+    const key = formatDayKey(date)
+    const eligible = habits.filter((habit) => !(habit.restDay && date.getDay() === 0))
+    const done = eligible.filter((habit) => (habit.logs || []).some((log) => log.date === key && log.done))
+    series.push({ date: formatDateLabel(key), completion: eligible.length ? Math.round((done.length / eligible.length) * 100) : null })
+  }
+  return series
+}
+
+function CategoryInsightsPanel({ metrics, habits }) {
+  const groups = INSIGHT_GROUPS.map((group) => ({
+    name: group,
+    metrics: metrics.filter((metric) => classifyMetric(metric) === group),
+  }))
+  const habitSeries = buildHabitCompletionSeries(habits || [])
+  const hasAnyData = groups.some((group) => group.metrics.length) || (habits || []).length
+
+  if (!hasAnyData) return null
+
+  return (
+    <section className="insights-panel">
+      <div className="overview-head">
+        <div>
+          <h2>Classified infographics</h2>
+          <p>Trends grouped by category over the last 14 days.</p>
+        </div>
+      </div>
+      <div className="insights-grid">
+        {groups.map((group) => {
+          if (group.name === 'Mindfulness & Habits' && !group.metrics.length) {
+            if (!(habits || []).length) return null
+            return (
+              <article key={group.name} className="panel-card insights-card">
+                <p className="eyebrow">{group.name.toUpperCase()}</p>
+                <h3>Daily habit completion</h3>
+                <ResponsiveContainer width="100%" height={180}>
+                  <LineChart data={habitSeries}>
+                    <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
+                    <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'var(--muted)' }} axisLine={false} tickLine={false} />
+                    <YAxis tick={{ fontSize: 10, fill: 'var(--muted)' }} axisLine={false} tickLine={false} domain={[0, 100]} unit="%" width={34} />
+                    <Tooltip contentStyle={{ background: 'var(--panel-alt)', border: '1px solid var(--line)', borderRadius: 10, fontSize: 12 }} />
+                    <Line type="monotone" dataKey="completion" name="Habit completion" stroke="#10B981" strokeWidth={2} dot={false} connectNulls />
+                  </LineChart>
+                </ResponsiveContainer>
+              </article>
+            )
+          }
+          if (!group.metrics.length) return null
+          const series = buildInsightSeries(group.metrics)
+          return (
+            <article key={group.name} className="panel-card insights-card">
+              <p className="eyebrow">{group.name.toUpperCase()}</p>
+              <h3>{group.name}</h3>
+              <ResponsiveContainer width="100%" height={180}>
+                <LineChart data={series}>
+                  <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
+                  <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'var(--muted)' }} axisLine={false} tickLine={false} />
+                  <YAxis tick={{ fontSize: 10, fill: 'var(--muted)' }} axisLine={false} tickLine={false} unit="%" width={34} />
+                  <Tooltip contentStyle={{ background: 'var(--panel-alt)', border: '1px solid var(--line)', borderRadius: 10, fontSize: 12 }} />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  {group.metrics.map((metric) => (
+                    <Line key={metric.id} type="monotone" dataKey={metric.id} name={metric.name} stroke={metric.color || '#00F0FF'} strokeWidth={2} dot={false} connectNulls />
+                  ))}
+                </LineChart>
+              </ResponsiveContainer>
+            </article>
+          )
+        })}
+      </div>
+    </section>
   )
 }
 
@@ -1302,6 +1441,8 @@ function Snapshot({ user, updateUser, setToast }) {
     <>
       <FocusForToday metrics={metrics} habits={user.habits || []} />
 
+      <CategoryInsightsPanel metrics={metrics} habits={user.habits || []} />
+
       <section className="overview-head">
         <div>
           <h2>Health metrics</h2>
@@ -1314,7 +1455,7 @@ function Snapshot({ user, updateUser, setToast }) {
       </section>
 
       <div className="metric-card-grid">
-        {metrics.map((metric) => {
+        {metrics.filter((metric) => !(user.hiddenMetricIds || []).includes(metric.id)).map((metric) => {
           const latestEntry = getMetricLatestEntry(metric)
           const progress = getMetricProgress(metric)
           const streak = getMetricStreak(metric)
@@ -4213,12 +4354,49 @@ function GratefulView({ user, updateUser, setToast }) {
 function SettingsView({ user, updateUser, setToast, onSignOutAll }) {
   const [form, setForm] = useState({
     name: user.name,
-    theme: user.theme || 'light',
+    themeFamily: user.themeFamily || resolveTheme(user).family,
+    themeMode: user.themeMode || resolveTheme(user).mode,
   })
+  const avatarInputRef = useRef(null)
+  const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
+  const hiddenMetricIds = user.hiddenMetricIds || []
 
   const saveProfile = () => {
-    updateUser({ name: form.name.trim() || user.name, theme: form.theme })
+    updateUser({ name: form.name.trim() || user.name, themeFamily: form.themeFamily, themeMode: form.themeMode })
     setToast('Profile saved')
+  }
+
+  const applyTheme = (patch) => {
+    setForm((current) => ({ ...current, ...patch }))
+    updateUser(patch)
+    setToast('Theme updated')
+  }
+
+  const handleAvatarPick = (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (!file.type.startsWith('image/')) {
+      setToast('Please choose an image file.')
+      return
+    }
+    if (file.size > 1.5 * 1024 * 1024) {
+      setToast('Image is too large (max 1.5MB).')
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => {
+      updateUser({ avatarUrl: String(reader.result || '') })
+      setToast('Avatar updated')
+    }
+    reader.readAsDataURL(file)
+  }
+
+  const toggleMetricVisibility = (metricId) => {
+    const nextHidden = hiddenMetricIds.includes(metricId)
+      ? hiddenMetricIds.filter((id) => id !== metricId)
+      : [...hiddenMetricIds, metricId]
+    updateUser({ hiddenMetricIds: nextHidden })
   }
 
   return (
@@ -4235,6 +4413,25 @@ function SettingsView({ user, updateUser, setToast, onSignOutAll }) {
           <p className="eyebrow">PROFILE</p>
           <h3>Account details</h3>
 
+          <div className="avatar-upload-row">
+            {user.avatarUrl ? (
+              <img className="avatar avatar-image avatar-large" src={user.avatarUrl} alt={user.name} />
+            ) : (
+              <div className="avatar avatar-large">{user.name.split(' ').map((part) => part[0]).join('')}</div>
+            )}
+            <div>
+              <button type="button" className="secondary-button" onClick={() => avatarInputRef.current?.click()}>
+                Upload photo
+              </button>
+              {user.avatarUrl && (
+                <button type="button" className="ghost-button" onClick={() => { updateUser({ avatarUrl: '' }); setToast('Avatar removed') }}>
+                  Remove
+                </button>
+              )}
+              <input ref={avatarInputRef} type="file" accept="image/*" hidden onChange={handleAvatarPick} />
+            </div>
+          </div>
+
           <label className="field-label">
             Name
             <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
@@ -4242,17 +4439,17 @@ function SettingsView({ user, updateUser, setToast, onSignOutAll }) {
 
           <label className="field-label">
             Theme
-            <select value={form.theme} onChange={(event) => {
-              const theme = event.target.value
-              setForm((current) => ({ ...current, theme }))
-              updateUser({ theme })
-              setToast(`${theme === 'dark' ? 'Dark' : 'Light'} mode enabled`)
-            }}>
-              <option value="light">Pastel Light</option>
-              <option value="dark">Midnight Dark</option>
-              <option value="ocean">Ocean Breeze</option>
+            <select value={form.themeFamily} onChange={(event) => applyTheme({ themeFamily: event.target.value })}>
               <option value="forest">Forest Calm</option>
-              <option value="sunset">Sunset Bloom</option>
+              <option value="ocean">Ocean Breeze</option>
+            </select>
+          </label>
+
+          <label className="field-label">
+            Mode
+            <select value={form.themeMode} onChange={(event) => applyTheme({ themeMode: event.target.value })}>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
             </select>
           </label>
 
@@ -4277,6 +4474,30 @@ function SettingsView({ user, updateUser, setToast, onSignOutAll }) {
             </button>
           </div>
         )}
+
+        <div className="panel-card settings-card">
+          <p className="eyebrow">DASHBOARD</p>
+          <h3>Manage metrics</h3>
+          <p>Hide metrics you don't want cluttering your dashboard grid.</p>
+          <ul className="manage-metrics-list">
+            {metrics.map((metric) => {
+              const hidden = hiddenMetricIds.includes(metric.id)
+              return (
+                <li key={metric.id} className="manage-metrics-row">
+                  <span><span className="metric-dot" style={{ background: metric.color }} />{metric.name}</span>
+                  <button
+                    type="button"
+                    className={`metric-visibility-toggle ${hidden ? '' : 'on'}`}
+                    onClick={() => toggleMetricVisibility(metric.id)}
+                    aria-pressed={!hidden}
+                  >
+                    {hidden ? 'Hidden' : 'Visible'}
+                  </button>
+                </li>
+              )
+            })}
+          </ul>
+        </div>
 
         <div className="panel-card settings-card">
           <p className="eyebrow">STAYING WITH IT</p>
