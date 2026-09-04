@@ -6,6 +6,7 @@ import {
   ChevronRight,
   CircleGauge,
   Dumbbell,
+  HeartPulse,
   LogOut,
   Menu,
   NotebookPen,
@@ -376,7 +377,7 @@ const seedUser = (email, name = 'Alex Smith', guest = false) => ({
 const initialUsers = read('fitlife-users', null) || {
   'alex@fitlife.app': { ...seedUser('alex@fitlife.app'), exerciseLibrary: [...exercisesSeed], exercises: [...exercisesSeed] },
 }
-const nav = [['Snapshot', CircleGauge], ['Exercises', Dumbbell], ['Sports', Trophy], ['Habits', Activity], ['Fasting', TimerReset], ['Log History', NotebookPen], ['Grateful', NotebookPen], ['Settings', Settings]]
+const nav = [['Snapshot', CircleGauge], ['My Life', NotebookPen], ['Health Metrics', Activity], ['Exercises', Dumbbell], ['Sports', Trophy], ['Habits', Activity], ['Fasting', TimerReset], ['Log History', NotebookPen], ['Grateful', NotebookPen], ['Settings', Settings]]
 
 function App() {
   const [users, setUsers] = useState(initialUsers)
@@ -448,7 +449,7 @@ function App() {
     const hydrate = async (authUser) => {
       if (!authUser) {
         if (active) {
-          setSession(null)
+          setSession((currentSession) => currentSession === 'guest@fitlife.app' ? currentSession : null)
           setCloudReady(true)
           setSyncState('offline')
         }
@@ -674,7 +675,9 @@ function App() {
           </div>
         </header>
 
-        {view === 'Snapshot' && <Snapshot user={user} updateUser={updateUser} setToast={setToast} />}
+        {view === 'Snapshot' && <Snapshot user={user} updateUser={updateUser} setToast={setToast} setView={setView} />}
+        {view === 'My Life' && <MyLifeView user={user} updateUser={updateUser} setToast={setToast} />}
+        {view === 'Health Metrics' && <HealthMetricsView user={user} updateUser={updateUser} setToast={setToast} />}
         {view === 'Exercises' && <ExercisesView user={user} updateUser={updateUser} setToast={setToast} />}
         {view === 'Sports' && <SportsHubView user={user} updateUser={updateUser} setToast={setToast} />}
         {view === 'Habits' && <HabitView user={user} updateUser={updateUser} setToast={setToast} />}
@@ -779,7 +782,7 @@ function Auth({ mode, setMode, onAuth, connectionError, supabaseEnabled }) {
           </button>
         </form>
 
-        <button className="guest-button" onClick={() => onAuth(seedUser('guest@fitlife.app', 'Guest Preview', true))}>
+        <button type="button" className="guest-button" onClick={() => onAuth(seedUser('guest@fitlife.app', 'Guest Preview', true))}>
           Preview as guest
         </button>
 
@@ -1173,9 +1176,289 @@ function CategoryInsightsPanel({ metrics, habits }) {
   )
 }
 
-function Snapshot({ user, updateUser, setToast }) {
-  const defaultMetricCategories = ['Heart', 'Mobility', 'General Wellbeing', 'Sleep', 'Mood', 'Exercise Related', 'Overall Health', 'Uncategorized']
+const getActivityDayScore = (user, dateInput, domain) => {
+  const key = formatDayKey(dateInput)
+  const metrics = user.healthMetrics || []
+  const metricEntries = metrics.map((metric) => {
+    const entry = (metric.entries || []).find((item) => formatDayKey(item.date) === key)
+    if (!entry) return 0
+    if (metric.measurementType === 'boolean') return entry.value ? 1 : 0
+    const target = Number(metric.target || 0)
+    return target > 0 ? Math.min(1, Number(entry.value || 0) / target) : Number(entry.value || 0) > 0 ? 0.5 : 0
+  })
+  const habitDone = (user.habits || []).filter((habit) => (habit.logs || []).some((log) => log.date === key && log.done)).length
+  const notes = (user.notes || []).filter((note) => formatDayKey(normalizeNoteDate(note)) === key).length
+  const workouts = (user.workoutSessions || []).filter((session) => formatDayKey(session.endedAt || session.startedAt) === key).length
+  if (domain === 'health') {
+    const healthMetrics = metrics.filter((metric) => /sleep|heart|water|hydrat|recovery|energy/i.test(`${metric.name} ${metric.category}`))
+    return healthMetrics.length ? healthMetrics.reduce((total, metric) => total + (metricEntries[metrics.indexOf(metric)] || 0), 0) / healthMetrics.length : 0
+  }
+  if (domain === 'mindfulness') return Math.min(1, (habitDone + notes) / Math.max(1, (user.habits || []).length + 1))
+  if (domain === 'sports') return workouts ? Math.min(1, workouts / 2) : 0
+  return Math.min(1, metricEntries.reduce((total, value) => total + value, 0) / Math.max(1, metricEntries.length))
+}
+
+const recentDates = (count) => Array.from({ length: count }, (_, index) => {
+  const date = new Date()
+  date.setDate(date.getDate() - (count - 1 - index))
+  return date
+})
+
+// Blends two hex colors together (0 = pure a, 1 = pure b).
+const lerpHexColor = (hexA, hexB, ratio) => {
+  const clamp = Math.min(1, Math.max(0, ratio))
+  const parse = (hex) => [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16))
+  const [ar, ag, ab] = parse(hexA)
+  const [br, bg, bb] = parse(hexB)
+  const mix = (a, b) => Math.round(a + (b - a) * clamp).toString(16).padStart(2, '0')
+  return `#${mix(ar, br)}${mix(ag, bg)}${mix(ab, bb)}`
+}
+
+// Bilinear color interpolation across the 4 corners of the bivariate diamond.
+const bivariateCellColor = (corners, rowFraction, colFraction) => {
+  const topColor = lerpHexColor(corners.top.color, corners.right.color, colFraction)
+  const bottomColor = lerpHexColor(corners.left.color, corners.bottom.color, colFraction)
+  return lerpHexColor(topColor, bottomColor, rowFraction)
+}
+
+const nearestCorner = (corners, rowFraction, colFraction) => {
+  if (rowFraction < 0.5) return colFraction < 0.5 ? corners.top : corners.right
+  return colFraction < 0.5 ? corners.left : corners.bottom
+}
+
+const findLatestMetricEntry = (metrics, pattern) => {
+  const candidates = metrics.filter((metric) => pattern.test(`${metric.name} ${metric.category}`))
+  let best = null
+  candidates.forEach((metric) => {
+    const entries = (metric.entries || []).slice().sort((a, b) => new Date(b.date) - new Date(a.date))
+    if (entries[0] && (!best || new Date(entries[0].date) > new Date(best.entry.date))) best = { metric, entry: entries[0] }
+  })
+  return best
+}
+
+const normalizeMetricScore = (metric, entry, fallback = 55) => {
+  if (!entry) return fallback
+  if (metric.measurementType === 'boolean') return entry.value ? 100 : 20
+  const target = Number(metric.target) || Number(entry.value) || 1
+  return Math.min(100, Math.round((Number(entry.value) / target) * 100))
+}
+
+// Y-Axis Readiness = (Sleep Score + Energy Score) / 2, X-Axis Strain = Active / Target calories.
+const computeHealthReadinessStrain = (user) => {
   const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
+  const sleep = findLatestMetricEntry(metrics, /sleep/i)
+  const energy = findLatestMetricEntry(metrics, /energy|mood|meditat/i)
+  const sleepScore = sleep ? normalizeMetricScore(sleep.metric, sleep.entry, 60) : 60
+  const energyScore = energy ? normalizeMetricScore(energy.metric, energy.entry, 55) : 55
+  const readiness = Math.round((sleepScore + energyScore) / 2)
+
+  const todayKey = todayValue()
+  const todaySessions = (user.workoutSessions || []).filter((session) => formatDayKey(session.endedAt || session.startedAt) === todayKey)
+  const activeCalories = todaySessions.reduce((total, session) => total + (Number(session.caloriesBurned) || Math.round((Number(session.durationMinutes) || 0) * 7)), 0)
+  const targetCalories = Number(user.targetCalories) || 500
+  const strain = Math.min(100, Math.round((activeCalories / targetCalories) * 100))
+
+  return { readiness, strain, sleepScore, energyScore, activeCalories, targetCalories }
+}
+
+// Y-Axis Duration/Volume vs X-Axis RPE/Intensity, based on the last 7 days of workouts.
+const computeSportsVolumeIntensity = (user) => {
+  const recent = recentDates(7).map((date) => formatDayKey(date))
+  const sessions = (user.workoutSessions || []).filter((session) => recent.includes(formatDayKey(session.endedAt || session.startedAt)))
+  const totalDuration = sessions.reduce((total, session) => total + (Number(session.durationMinutes) || Math.round((session.durationMs || 0) / 60000)), 0)
+  const volume = Math.min(100, Math.round((totalDuration / 180) * 100))
+  const intensityScores = sessions.map((session) => {
+    const durationMinutes = Number(session.durationMinutes) || Math.round((session.durationMs || 0) / 60000) || 1
+    const distanceKm = Number(session.distanceKm) || 0
+    if (distanceKm > 0) return Math.min(100, Math.round((distanceKm / (durationMinutes / 60)) * 10))
+    return 50
+  })
+  const intensity = intensityScores.length ? Math.round(intensityScores.reduce((total, value) => total + value, 0) / intensityScores.length) : 35
+
+  return { volume, intensity, totalDuration, sessionsCount: sessions.length }
+}
+
+// Y-Axis Habit Completion % vs X-Axis Sleep Quality / REM.
+const computeHabitsSleepMatrix = (user) => {
+  const habits = user.habits || []
+  const days = recentDates(7).map((date) => formatDayKey(date))
+  const eligibleLogs = habits.flatMap((habit) => days
+    .map((key) => ({ habit, key }))
+    .filter(({ habit: habitItem, key: entryKey }) => !(habitItem.restDay && new Date(`${entryKey}T00:00:00`).getDay() === 0)))
+  const doneCount = eligibleLogs.filter(({ habit: habitItem, key: entryKey }) => (habitItem.logs || []).some((entry) => entry.date === entryKey && entry.done)).length
+  const completion = eligibleLogs.length ? Math.round((doneCount / eligibleLogs.length) * 100) : 0
+
+  const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
+  const sleep = findLatestMetricEntry(metrics, /sleep|rem/i)
+  const sleepScore = sleep ? normalizeMetricScore(sleep.metric, sleep.entry, 60) : 60
+
+  return { completion, sleepScore }
+}
+
+function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corners, exactLabel, gridSize = 3 }) {
+  const [activeKey, setActiveKey] = useState(null)
+  const cells = []
+  for (let row = 0; row < gridSize; row += 1) {
+    for (let col = 0; col < gridSize; col += 1) {
+      const rowFraction = row / (gridSize - 1)
+      const colFraction = col / (gridSize - 1)
+      const color = bivariateCellColor(corners, rowFraction, colFraction)
+      const corner = nearestCorner(corners, rowFraction, colFraction)
+      cells.push({ row, col, color, corner, key: `${row}-${col}` })
+    }
+  }
+  const activeCell = cells.find((cell) => cell.key === activeKey)
+  const pointCorner = nearestCorner(corners, 1 - yValue / 100, xValue / 100)
+  const displayCorner = activeCell?.corner || pointCorner
+
+  return (
+    <article className="panel-card bivariate-diamond-card">
+      <div className="activity-heatmap-heading">
+        <div><p className="eyebrow">{eyebrow}</p><h3>{title}</h3></div>
+        <span className="heatmap-legend-label">{exactLabel}</span>
+      </div>
+      <div className="bivariate-diamond-body">
+        <span className="bivariate-axis-label bivariate-axis-top">{corners.top.label}</span>
+        <span className="bivariate-axis-label bivariate-axis-left">{corners.left.label}</span>
+        <span className="bivariate-axis-label bivariate-axis-right">{corners.right.label}</span>
+        <span className="bivariate-axis-label bivariate-axis-bottom">{corners.bottom.label}</span>
+        <div className="bivariate-diamond-wrap">
+          <div className="bivariate-diamond-grid" style={{ gridTemplateColumns: `repeat(${gridSize}, 1fr)`, gridTemplateRows: `repeat(${gridSize}, 1fr)` }}>
+            {cells.map((cell) => (
+              <button
+                key={cell.key}
+                type="button"
+                className={`bivariate-cell ${activeKey === cell.key ? 'active' : ''}`}
+                style={{ background: cell.color }}
+                title={`${cell.corner.label}: ${cell.corner.advice}`}
+                aria-label={`${cell.corner.label}: ${cell.corner.advice}`}
+                onMouseEnter={() => setActiveKey(cell.key)}
+                onFocus={() => setActiveKey(cell.key)}
+                onClick={() => setActiveKey(cell.key)}
+              />
+            ))}
+            <span
+              className="bivariate-indicator"
+              style={{ left: `${xValue}%`, top: `${100 - yValue}%` }}
+              title={`Current: ${yLabel} ${Math.round(yValue)}% • ${xLabel} ${Math.round(xValue)}%`}
+            />
+          </div>
+        </div>
+      </div>
+      <div className="bivariate-axis-caption"><span>{yLabel} ↕</span><span>{xLabel} ↔</span></div>
+      <div className="bivariate-info-panel">
+        <strong style={{ color: displayCorner.color }}>{displayCorner.label}</strong>
+        <p>{displayCorner.advice}</p>
+      </div>
+    </article>
+  )
+}
+
+function SnapshotHeatmaps({ user }) {
+  const health = computeHealthReadinessStrain(user)
+  const sports = computeSportsVolumeIntensity(user)
+  const habitsMatrix = computeHabitsSleepMatrix(user)
+
+  return (
+    <section className="snapshot-heatmaps">
+      <div className="overview-head"><div><h2>Activity at a glance</h2><p>Bivariate matrices plotting how your health, training, and habits intersect right now.</p></div></div>
+      <div className="snapshot-heatmap-grid">
+        <BivariateDiamond
+          eyebrow="HEALTH & RECOVERY"
+          title="Readiness × Strain"
+          xLabel="Training Load / Stress"
+          yLabel="Physiological Readiness"
+          xValue={health.strain}
+          yValue={health.readiness}
+          exactLabel={`Readiness ${health.readiness}% • Strain ${health.strain}%`}
+          corners={{
+            top: { label: 'Peak Prime / Recharged', color: '#00E5FF', advice: 'Readiness is high and strain is low — a great day to push a hard session.' },
+            right: { label: 'Heroic Effort / Overreach', color: '#7C3AED', advice: 'You are pushing hard while still recovered. Keep an eye on fatigue creeping in.' },
+            left: { label: 'Resting / Passive Recovery', color: '#94A3B8', advice: 'Low readiness and low strain — an easy, restorative day.' },
+            bottom: { label: 'High Stress / Systemic Burnout', color: '#FF0055', advice: 'Readiness is low but strain is high. Prioritize sleep and active recovery today.' },
+          }}
+        />
+        <BivariateDiamond
+          eyebrow="SPORTS & WORKOUTS"
+          title="Volume × Intensity"
+          xLabel="RPE / Intensity"
+          yLabel="Duration / Volume"
+          xValue={sports.intensity}
+          yValue={sports.volume}
+          exactLabel={`Volume ${sports.volume}% • Intensity ${sports.intensity}%`}
+          corners={{
+            top: { label: 'Aerobic Base / Zone 2', color: '#22D3EE', advice: 'High volume, low intensity — solid aerobic base-building work.' },
+            right: { label: 'Peak Endurance Overhaul', color: '#7C3AED', advice: 'High volume and high intensity. Make sure recovery days follow.' },
+            left: { label: 'Active Recovery / Walk', color: '#94A3B8', advice: 'Low volume and low intensity — a light, active recovery day.' },
+            bottom: { label: 'HIIT / Anaerobic Burst', color: '#FF7A00', advice: 'Short and intense. Great for anaerobic gains, watch your recovery time.' },
+          }}
+        />
+        <BivariateDiamond
+          eyebrow="HABITS & MINDFULNESS"
+          title="Consistency × Rest"
+          xLabel="Sleep Quality / REM"
+          yLabel="Habit Completion %"
+          xValue={habitsMatrix.sleepScore}
+          yValue={habitsMatrix.completion}
+          exactLabel={`Habits ${habitsMatrix.completion}% • Sleep ${habitsMatrix.sleepScore}%`}
+          corners={{
+            top: { label: 'Running on Fumes', color: '#FBBF24', advice: 'Habits are on track but rest is low. Protect your sleep to sustain this.' },
+            right: { label: 'Unstoppable Flow State', color: '#00FFA3', advice: 'High rest and high consistency — this is your peak performance zone.' },
+            left: { label: 'Disrupted Rhythm', color: '#FF0055', advice: 'Both rest and consistency are low. Consider resetting your routine.' },
+            bottom: { label: 'Passive Reset Day', color: '#60A5FA', advice: 'Rest is strong but habits slipped. A gentle day to ease back in.' },
+          }}
+        />
+      </div>
+    </section>
+  )
+}
+
+function ExploreDataQuickNav({ setView }) {
+  const links = [
+    { label: 'Snapshots', icon: '📊', detail: 'Global heatmaps & bivariate overviews', view: 'Snapshot' },
+    { label: 'Health Metrics', icon: '🩺', detail: 'Daily trackers & inputs', view: 'Health Metrics' },
+    { label: 'Sports & Workouts', icon: '🏃', detail: 'Strava feed & activity logs', view: 'Sports' },
+    { label: 'My Life', icon: '🗓️', detail: 'Master calendar & daily journal', view: 'My Life' },
+  ]
+
+  return (
+    <section className="explore-data-nav">
+      <div className="overview-head"><div><h2>Explore your data</h2><p>Jump straight to the view you need.</p></div></div>
+      <div className="explore-data-chip-row">
+        {links.map((link) => (
+          <button key={link.view} type="button" className="explore-data-chip" onClick={() => setView(link.view)}>
+            <span className="explore-data-chip-icon">{link.icon}</span>
+            <span>
+              <strong>{link.label}</strong>
+              <small>{link.detail}</small>
+            </span>
+          </button>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function Snapshot({ user, updateUser, setToast, setView }) {
+  const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
+
+  return (
+    <>
+      <ExploreDataQuickNav setView={setView} />
+
+      <FocusForToday metrics={metrics} habits={user.habits || []} />
+
+      <CategoryInsightsPanel metrics={metrics} habits={user.habits || []} />
+
+      <SnapshotHeatmaps user={user} />
+    </>
+  )
+}
+
+function HealthMetricsView({ user, updateUser, setToast }) {
+  const defaultMetricCategories = ['Heart', 'Mobility', 'General Wellbeing', 'Sleep', 'Mood', 'Exercise Related', 'Overall Health', 'Uncategorized']
+  const hiddenMetricIds = user.hiddenMetricIds || []
+  const metrics = (user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics).filter((metric) => !hiddenMetricIds.includes(metric.id))
   const [metricModalOpen, setMetricModalOpen] = useState(false)
   const [chartWindow, setChartWindow] = useState(7)
   const [metricForm, setMetricForm] = useState({
@@ -1448,10 +1731,6 @@ function Snapshot({ user, updateUser, setToast }) {
 
   return (
     <>
-      <FocusForToday metrics={metrics} habits={user.habits || []} />
-
-      <CategoryInsightsPanel metrics={metrics} habits={user.habits || []} />
-
       <section className="overview-head">
         <div>
           <h2>Health metrics</h2>
@@ -1463,129 +1742,137 @@ function Snapshot({ user, updateUser, setToast }) {
         </button>
       </section>
 
-      <div className="metric-card-grid">
-        {metrics.filter((metric) => !(user.hiddenMetricIds || []).includes(metric.id)).map((metric) => {
-          const latestEntry = getMetricLatestEntry(metric)
-          const progress = getMetricProgress(metric)
-          const streak = getMetricStreak(metric)
-          const heatmap = getMetricHeatmap(metric)
-          const latestValue = latestEntry ? getEntryValue(metric, latestEntry) : 'No data'
-          const barData = getMetricTrendData(metric, chartWindow)
-          const barMax = Math.max(1, ...barData.map((entry) => Number(entry.value) || 0))
-          const goalDetails = getMetricGoalDetails(metric, latestEntry)
+      {metrics.length === 0 ? (
+        <div className="panel-card empty-state-card">
+          <p className="eyebrow">NO VISIBLE METRICS</p>
+          <h3>All metrics are hidden</h3>
+          <p>Use Settings → Manage Metrics to show the cards you want on this dashboard.</p>
+        </div>
+      ) : (
+        <div className="metric-card-grid">
+          {metrics.map((metric) => {
+            const latestEntry = getMetricLatestEntry(metric)
+            const progress = getMetricProgress(metric)
+            const streak = getMetricStreak(metric)
+            const heatmap = getMetricHeatmap(metric)
+            const latestValue = latestEntry ? getEntryValue(metric, latestEntry) : 'No data'
+            const barData = getMetricTrendData(metric, chartWindow)
+            const barMax = Math.max(1, ...barData.map((entry) => Number(entry.value) || 0))
+            const goalDetails = getMetricGoalDetails(metric, latestEntry)
 
-          return (
-            <article
-              key={metric.id}
-              className="metric-card panel-card"
-              style={{ '--metric-accent': metric.color }}
-              onClick={() => setSelectedMetricId(metric.id)}
-            >
-              <div className="metric-card-header">
-                <div className="metric-heading-wrap">
-                  <span className="metric-dot" style={{ background: metric.color }} />
-                  <div>
-                    <strong>{metric.name}</strong>
-                    <small>{metric.category}</small>
+            return (
+              <article
+                key={metric.id}
+                className="metric-card panel-card"
+                style={{ '--metric-accent': metric.color }}
+                onClick={() => setSelectedMetricId(metric.id)}
+              >
+                <div className="metric-card-header">
+                  <div className="metric-heading-wrap">
+                    <span className="metric-dot" style={{ background: metric.color }} />
+                    <div>
+                      <strong>{metric.name}</strong>
+                      <small>{metric.category}</small>
+                    </div>
+                  </div>
+                  <div className="metric-card-actions">
+                    <div className="metric-value-pill">{latestValue}</div>
+                    <button type="button" className="snapshot-edit-button" onClick={(event) => { event.stopPropagation(); editMetric(metric) }}>Edit metric</button>
+                    <button type="button" className="icon-button subtle" onClick={(event) => { event.stopPropagation(); deleteMetric(metric.id) }} aria-label={`Delete ${metric.name}`}><Trash2 size={13} /></button>
+                    <button
+                      type="button"
+                      className={`metric-quick-toggle ${isMetricLoggedToday(metric) ? 'done' : ''}`}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        quickLogMetric(metric.id)
+                      }}
+                    >
+                      {isMetricLoggedToday(metric) ? '✓ Completed Today' : 'Complete Today'}
+                    </button>
                   </div>
                 </div>
-                <div className="metric-card-actions">
-                  <div className="metric-value-pill">{latestValue}</div>
-                  <button type="button" className="snapshot-edit-button" onClick={(event) => { event.stopPropagation(); editMetric(metric) }}>Edit metric</button>
-                  <button type="button" className="icon-button subtle" onClick={(event) => { event.stopPropagation(); deleteMetric(metric.id) }} aria-label={`Delete ${metric.name}`}><Trash2 size={13} /></button>
-                  <button
-                    type="button"
-                    className={`metric-quick-toggle ${isMetricLoggedToday(metric) ? 'done' : ''}`}
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      quickLogMetric(metric.id)
-                    }}
-                  >
-                    {isMetricLoggedToday(metric) ? '✓ Completed Today' : 'Complete Today'}
-                  </button>
-                </div>
-              </div>
 
-              <div className="metric-status-row">
-                <span className="metric-target-badge">{progress}% target</span>
-                <span className="metric-streak-badge">🔥 {streak} days</span>
-              </div>
-
-              {goalDetails && (
-                <div className="metric-goal-summary">
-                  <div className="metric-goal-values"><span>Current <strong>{goalDetails.current} {metric.unit}</strong></span><span>Target <strong>{goalDetails.target} {metric.unit}</strong></span></div>
-                  <div className="metric-goal-track"><span style={{ width: `${goalDetails.progress}%`, background: metric.color }} /></div>
-                  <small>{goalDetails.distance === 0 ? 'Target reached' : `${goalDetails.distance} ${metric.unit || 'units'} ${goalDetails.lowerIsBetter ? 'above' : 'remaining to'} target`}</small>
+                <div className="metric-status-row">
+                  <span className="metric-target-badge">{progress}% target</span>
+                  <span className="metric-streak-badge">🔥 {streak} days</span>
                 </div>
-              )}
 
-              {metric.measurementType === 'boolean' && (
-                <div className={`metric-bool-pill ${latestEntry?.value ? 'done' : 'pending'}`}>
-                  {latestEntry?.value ? '✓ Completed today' : 'Not done today'}
-                </div>
-              )}
-
-              <div className="calendar-strip">
-                <div className="mini-weekday-row compact-row">
-                  {['M', 'T', 'W', 'Th', 'F', 'S', 'S'].map((label) => (
-                    <span key={`${metric.id}-weekday-${label}`}>{label}</span>
-                  ))}
-                </div>
-                <div className="metric-heatmap" aria-label={`${metric.name} activity heatmap`}>
-                  {heatmap.map((day) => (
-                    <span
-                      key={`${metric.id}-${day.key}`}
-                      className={`metric-square intensity-${day.intensity} ${day.isToday ? 'today' : ''}`}
-                      title={`${day.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}: ${day.value === null ? 'No data' : getEntryValue(metric, { value: day.value, date: day.key })}`}
-                    >
-                      <span className="metric-date-stack">
-                        <small>{new Intl.DateTimeFormat('en-US', { month: 'short' }).format(day.date).toUpperCase()}</small>
-                        <strong>{day.date.getDate()}</strong>
-                      </span>
-                    </span>
-                  ))}
-                </div>
-              </div>
-
-              <div className="metric-chart-wrap">
-                {metric.chartType === 'bar' ? (
-                  <>
-                    <div className="chart-window-toggle"><span>Bar view</span><button type="button" className={chartWindow === 7 ? 'active' : ''} onClick={(event) => { event.stopPropagation(); setChartWindow(7) }}>7D</button><button type="button" className={chartWindow === 30 ? 'active' : ''} onClick={(event) => { event.stopPropagation(); setChartWindow(30) }}>30D</button></div>
-                    <div className="metric-bar-chart">
-                      <div className="metric-y-axis"><span>{barMax}</span><span>{Math.round(barMax / 2)}</span><span>0</span></div>
-                      <div className="metric-bar-plot">
-                        {metric.target > 0 && <span className="metric-bar-target" style={{ bottom: `${Math.min(100, (Number(metric.target) / barMax) * 100)}%` }} />}
-                        <div className="metric-bars" aria-label={`${metric.name} bar chart`}>
-                          {barData.map((entry, index) => <span key={`${metric.id}-bar-${index}`} style={{ height: `${Math.max(8, ((Number(entry.value) || 0) / barMax) * 100)}%`, background: metric.color }} title={`${entry.date}: ${entry.value}`} />)}
-                        </div>
-                        <div className="metric-x-axis">{barData.map((entry, index) => <span key={`${metric.id}-bar-label-${index}`}>{entry.date.slice(0, 5)}</span>)}</div>
-                      </div>
-                    </div>
-                  </>
-                ) : metric.chartType === 'radial' ? (
-                  <div className="metric-radial-chart"><svg viewBox="0 0 160 95"><path className="metric-radial-track" d="M20 80 A60 60 0 0 1 140 80" /><path className="metric-radial-progress" d="M20 80 A60 60 0 0 1 140 80" pathLength="100" style={{ stroke: metric.color, strokeDasharray: `${getMetricProgressValue(metric)} 100` }} /></svg><strong>{getMetricProgressValue(metric)}%</strong></div>
-                ) : (
-                  <ResponsiveContainer width="100%" height={96}>
-                    <AreaChart data={getMetricTrendData(metric)}>
-                      <defs>
-                        <linearGradient id={`fill-${metric.id}`} x1="0" x2="0" y1="0" y2="1">
-                          <stop offset="0%" stopColor={metric.color} stopOpacity={0.5} />
-                          <stop offset="100%" stopColor={metric.color} stopOpacity={0.06} />
-                        </linearGradient>
-                      </defs>
-                      <XAxis dataKey="date" tickLine={false} axisLine={{ stroke: 'var(--chart-grid)' }} tick={{ fill: 'var(--muted)', fontSize: 9 }} minTickGap={18} />
-                      <YAxis width={30} tickLine={false} axisLine={{ stroke: 'var(--chart-grid)' }} tick={{ fill: 'var(--muted)', fontSize: 9 }} domain={['dataMin - 10', 'dataMax + 10']} />
-                      <Tooltip />
-                      <Area type="monotone" dataKey="value" stroke={metric.color} strokeWidth={2.5} fill={`url(#fill-${metric.id})`} />
-                      <Line type="monotone" dataKey="target" stroke="var(--chart-target)" strokeDasharray="5 5" strokeWidth={1.5} dot={false} />
-                    </AreaChart>
-                  </ResponsiveContainer>
+                {goalDetails && (
+                  <div className="metric-goal-summary">
+                    <div className="metric-goal-values"><span>Current <strong>{goalDetails.current} {metric.unit}</strong></span><span>Target <strong>{goalDetails.target} {metric.unit}</strong></span></div>
+                    <div className="metric-goal-track"><span style={{ width: `${goalDetails.progress}%`, background: metric.color }} /></div>
+                    <small>{goalDetails.distance === 0 ? 'Target reached' : `${goalDetails.distance} ${metric.unit || 'units'} ${goalDetails.lowerIsBetter ? 'above' : 'remaining to'} target`}</small>
+                  </div>
                 )}
-              </div>
-            </article>
-          )
-        })}
-      </div>
+
+                {metric.measurementType === 'boolean' && (
+                  <div className={`metric-bool-pill ${latestEntry?.value ? 'done' : 'pending'}`}>
+                    {latestEntry?.value ? '✓ Completed today' : 'Not done today'}
+                  </div>
+                )}
+
+                <div className="calendar-strip">
+                  <div className="mini-weekday-row compact-row">
+                    {['M', 'T', 'W', 'Th', 'F', 'S', 'S'].map((label) => (
+                      <span key={`${metric.id}-weekday-${label}`}>{label}</span>
+                    ))}
+                  </div>
+                  <div className="metric-heatmap" aria-label={`${metric.name} activity heatmap`}>
+                    {heatmap.map((day) => (
+                      <span
+                        key={`${metric.id}-${day.key}`}
+                        className={`metric-square intensity-${day.intensity} ${day.isToday ? 'today' : ''}`}
+                        title={`${day.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}: ${day.value === null ? 'No data' : getEntryValue(metric, { value: day.value, date: day.key })}`}
+                      >
+                        <span className="metric-date-stack">
+                          <small>{new Intl.DateTimeFormat('en-US', { month: 'short' }).format(day.date).toUpperCase()}</small>
+                          <strong>{day.date.getDate()}</strong>
+                        </span>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="metric-chart-wrap">
+                  {metric.chartType === 'bar' ? (
+                    <>
+                      <div className="chart-window-toggle"><span>Bar view</span><button type="button" className={chartWindow === 7 ? 'active' : ''} onClick={(event) => { event.stopPropagation(); setChartWindow(7) }}>7D</button><button type="button" className={chartWindow === 30 ? 'active' : ''} onClick={(event) => { event.stopPropagation(); setChartWindow(30) }}>30D</button></div>
+                      <div className="metric-bar-chart">
+                        <div className="metric-y-axis"><span>{barMax}</span><span>{Math.round(barMax / 2)}</span><span>0</span></div>
+                        <div className="metric-bar-plot">
+                          {metric.target > 0 && <span className="metric-bar-target" style={{ bottom: `${Math.min(100, (Number(metric.target) / barMax) * 100)}%` }} />}
+                          <div className="metric-bars" aria-label={`${metric.name} bar chart`}>
+                            {barData.map((entry, index) => <span key={`${metric.id}-bar-${index}`} style={{ height: `${Math.max(8, ((Number(entry.value) || 0) / barMax) * 100)}%`, background: metric.color }} title={`${entry.date}: ${entry.value}`} />)}
+                          </div>
+                          <div className="metric-x-axis">{barData.map((entry, index) => <span key={`${metric.id}-bar-label-${index}`}>{entry.date.slice(0, 5)}</span>)}</div>
+                        </div>
+                      </div>
+                    </>
+                  ) : metric.chartType === 'radial' ? (
+                    <div className="metric-radial-chart"><svg viewBox="0 0 160 95"><path className="metric-radial-track" d="M20 80 A60 60 0 0 1 140 80" /><path className="metric-radial-progress" d="M20 80 A60 60 0 0 1 140 80" pathLength="100" style={{ stroke: metric.color, strokeDasharray: `${getMetricProgressValue(metric)} 100` }} /></svg><strong>{getMetricProgressValue(metric)}%</strong></div>
+                  ) : (
+                    <ResponsiveContainer width="100%" height={96}>
+                      <AreaChart data={getMetricTrendData(metric)}>
+                        <defs>
+                          <linearGradient id={`fill-${metric.id}`} x1="0" x2="0" y1="0" y2="1">
+                            <stop offset="0%" stopColor={metric.color} stopOpacity={0.5} />
+                            <stop offset="100%" stopColor={metric.color} stopOpacity={0.06} />
+                          </linearGradient>
+                        </defs>
+                        <XAxis dataKey="date" tickLine={false} axisLine={{ stroke: 'var(--chart-grid)' }} tick={{ fill: 'var(--muted)', fontSize: 9 }} minTickGap={18} />
+                        <YAxis width={30} tickLine={false} axisLine={{ stroke: 'var(--chart-grid)' }} tick={{ fill: 'var(--muted)', fontSize: 9 }} domain={['dataMin - 10', 'dataMax + 10']} />
+                        <Tooltip />
+                        <Area type="monotone" dataKey="value" stroke={metric.color} strokeWidth={2.5} fill={`url(#fill-${metric.id})`} />
+                        <Line type="monotone" dataKey="target" stroke="var(--chart-target)" strokeDasharray="5 5" strokeWidth={1.5} dot={false} />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  )}
+                </div>
+              </article>
+            )
+          })}
+        </div>
+      )}
 
       {metricModalOpen && (
         <div className="modal-backdrop metric-modal-backdrop" onClick={closeMetricModal}>
@@ -2883,6 +3170,16 @@ function HabitView({ user, updateUser, setToast }) {
     date.setDate(calendarGridStart.getDate() + index)
     return date
   })
+  const visibleMonthLabels = contributionDays.reduce((months, date) => {
+    const monthKey = `${date.getFullYear()}-${date.getMonth()}`
+    if (!months.some((entry) => entry.key === monthKey)) {
+      months.push({
+        key: monthKey,
+        label: new Intl.DateTimeFormat('en-US', { month: 'short' }).format(date),
+      })
+    }
+    return months
+  }, [])
   const getDayHabitSummary = (date) => {
     const dayKey = formatDayKey(date)
     const performed = user.habits.filter((habit) => (habit.logs || []).find((entry) => entry.date === dayKey)?.done).length
@@ -3048,7 +3345,9 @@ function HabitView({ user, updateUser, setToast }) {
       <section className="panel-card habit-overview-calendar">
         <div className="panel-heading compact">
           <div><p className="eyebrow">CONTRIBUTION GRID</p><h3>Habits performed</h3></div>
-          <span className="habit-calendar-month">{new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric' }).format(calendarMonthStart)}</span>
+          <div className="habit-month-legend" aria-label="Visible habit months">
+            {visibleMonthLabels.map((month) => <span key={month.key}>{month.label}</span>)}
+          </div>
         </div>
         <div className="habit-calendar-weekdays" aria-hidden="true">{['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((label, index) => <span key={`overview-weekday-${index}`}>{label}</span>)}</div>
         <div className="habit-overview-grid">
@@ -3101,7 +3400,9 @@ function HabitView({ user, updateUser, setToast }) {
                 <span>{(habit.trackingType || 'boolean') === 'time' ? `Target ${habit.targetValue || habit.target || '--'}` : (habit.trackingType || 'boolean') === 'numeric' ? `${habit.targetValue || habit.target || 0} ${habit.unit || 'units'} target` : 'Daily check-in'}</span>
               </div>
 
-              <div className="habit-grid-months" aria-hidden="true"><span>{new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric' }).format(calendarMonthStart)}</span></div>
+              <div className="habit-grid-months" aria-hidden="true">
+                {visibleMonthLabels.map((month) => <span key={`${habit.id}-${month.key}`}>{month.label}</span>)}
+              </div>
               <div className="habit-grid-axis-labels" aria-hidden="true">
                 {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((label, index) => <span key={`${habit.id}-axis-${index}`}>{label}</span>)}
               </div>
@@ -4277,6 +4578,81 @@ function LogHistoryView({ user, updateUser, setToast }) {
         setDeletingSession(null)
         setToast('Workout session deleted')
       }} />}
+    </>
+  )
+}
+
+function MyLifeView({ user, updateUser, setToast }) {
+  const [selectedDate, setSelectedDate] = useState(todayValue())
+  const [monthDate, setMonthDate] = useState(() => new Date())
+  const [reflection, setReflection] = useState('')
+  const metrics = user.healthMetrics || []
+  const selectedKey = selectedDate
+  const selectedMetrics = metrics.flatMap((metric) => (metric.entries || []).filter((entry) => formatDayKey(entry.date) === selectedKey).map((entry) => ({ ...entry, metric })))
+  const selectedHabits = (user.habits || []).filter((habit) => (habit.logs || []).some((entry) => entry.date === selectedKey && entry.done))
+  const selectedWorkouts = (user.workoutSessions || []).filter((session) => formatDayKey(session.endedAt || session.startedAt) === selectedKey)
+  const selectedNotes = (user.notes || []).filter((note) => formatDayKey(normalizeNoteDate(note)) === selectedKey)
+  const monthStart = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1)
+  const gridStart = new Date(monthStart)
+  gridStart.setDate(1 - ((monthStart.getDay() + 6) % 7))
+  const monthDays = Array.from({ length: 42 }, (_, index) => {
+    const date = new Date(gridStart)
+    date.setDate(gridStart.getDate() + index)
+    return date
+  })
+  const hasActivity = (date) => getActivityDayScore(user, date, 'all') > 0 || [
+    ...(user.workoutSessions || []).map((session) => formatDayKey(session.endedAt || session.startedAt)),
+    ...(user.notes || []).map((note) => formatDayKey(normalizeNoteDate(note))),
+  ].includes(formatDayKey(date))
+  const saveReflection = () => {
+    const text = reflection.trim()
+    if (!text) return
+    updateUser({ notes: [{ id: uid(), title: 'Daily reflection', text, date: `${selectedKey}T12:00:00` }, ...(user.notes || [])] })
+    setReflection('')
+    setToast('Daily reflection saved')
+  }
+
+  return (
+    <>
+      <section className="overview-head">
+        <div>
+          <h2>My Life</h2>
+          <p>Master calendar, daily reflections, and the moments that shaped your week.</p>
+        </div>
+      </section>
+      <div className="my-life-layout">
+        <section className="panel-card my-life-calendar">
+          <div className="calendar-period-heading">
+            <button className="icon-button subtle" onClick={() => setMonthDate(new Date(monthDate.getFullYear(), monthDate.getMonth() - 1, 1))} aria-label="Previous month"><ChevronLeft size={16} /></button>
+            <h3>{monthDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}</h3>
+            <button className="icon-button subtle" onClick={() => setMonthDate(new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 1))} aria-label="Next month"><ChevronRight size={16} /></button>
+          </div>
+          <div className="weekday-row">{['M', 'T', 'W', 'Th', 'F', 'S', 'S'].map((day, index) => <span key={`${day}-${index}`}>{day}</span>)}</div>
+          <div className="gratitude-calendar-grid">
+            {monthDays.map((date) => {
+              const key = formatDayKey(date)
+              return <button key={key} className={`calendar-day ${key === selectedKey ? 'selected' : ''} ${date.getMonth() !== monthDate.getMonth() ? 'outside-month' : ''} ${hasActivity(date) ? 'has-entry' : ''}`} onClick={() => setSelectedDate(key)}><span className="calendar-month">{date.toLocaleDateString('en-US', { month: 'short' }).toUpperCase()}</span><strong>{date.getDate()}</strong>{hasActivity(date) && <i className="calendar-entry-dot" />}</button>
+            })}
+          </div>
+        </section>
+
+        <section className="panel-card my-life-day">
+          <p className="eyebrow">A SNAPSHOT OF MY LIFE</p>
+          <h3>{formatDateLabel(`${selectedKey}T00:00:00`)}</h3>
+          <div className="my-life-stat-strip"><span><strong>{selectedMetrics.length}</strong> metrics</span><span><strong>{selectedHabits.length}</strong> habits</span><span><strong>{selectedWorkouts.length}</strong> workouts</span><span><strong>{selectedNotes.length}</strong> notes</span></div>
+          <div className="my-life-timeline">
+            {selectedMetrics.map(({ metric, value, id }) => <div className="my-life-entry" key={`metric-${id}`}><span className="metric-dot" style={{ background: metric.color }} /><div><strong>{metric.name}</strong><p>{metric.measurementType === 'boolean' ? (value ? 'Completed' : 'Not completed') : `${value} ${metric.unit || ''}`}</p></div></div>)}
+            {selectedHabits.map((habit) => <div className="my-life-entry" key={`habit-${habit.id}`}><span className="my-life-entry-icon">✓</span><div><strong>{habit.name}</strong><p>Habit completed</p></div></div>)}
+            {selectedWorkouts.map((session) => <div className="my-life-entry" key={`workout-${session.id}`}><span className="my-life-entry-icon">🏋</span><div><strong>{session.routineName}</strong><p>{session.durationMinutes || Math.round((session.durationMs || 0) / 60000)} min {session.distanceKm ? `• ${session.distanceKm} km` : ''}</p></div></div>)}
+            {selectedNotes.map((note) => <div className="my-life-entry" key={`note-${note.id}`}><span className="my-life-entry-icon">✦</span><div><strong>{note.title || 'Daily reflection'}</strong><p>{note.text}</p></div></div>)}
+            {!selectedMetrics.length && !selectedHabits.length && !selectedWorkouts.length && !selectedNotes.length && <p className="empty-state">Nothing logged for this day yet.</p>}
+          </div>
+          <div className="my-life-reflection">
+            <label className="field-label">Add daily reflection<textarea value={reflection} onChange={(event) => setReflection(event.target.value)} placeholder="What mattered today?" rows="3" /></label>
+            <button className="primary-button" onClick={saveReflection}><Save size={15} /> Save reflection</button>
+          </div>
+        </section>
+      </div>
     </>
   )
 }

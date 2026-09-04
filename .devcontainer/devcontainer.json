@@ -1,0 +1,12 @@
+{
+  "name": "Fitness Life Tracker",
+  "image": "mcr.microsoft.com/vscode/devcontainers/universal:latest",
+  "forwardPorts": [5173],
+  "portsAttributes": {
+    "5173": {
+      "label": "Vite Dev Server",
+      "protocol": "http",
+      "onAutoForward": "openPreview"
+    }
+  }
+}
