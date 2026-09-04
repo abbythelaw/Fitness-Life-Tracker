@@ -1284,15 +1284,50 @@ const recentDates = (count) => Array.from({ length: count }, (_, index) => {
   return date
 })
 
-// Blends two hex colors together (0 = pure a, 1 = pure b).
-const lerpHexColor = (hexA, hexB, ratio) => {
-  const clamp = Math.min(1, Math.max(0, ratio))
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
+
+// Simple streak helpers reused by the individual habit heatmap cards.
+const getHabitStreak = (habit) => {
+  const entries = new Set((habit.logs || []).filter((entry) => entry.done).map((entry) => entry.date))
+  let streak = 0
+  let cursor = new Date()
+  while (entries.has(formatDayKey(cursor))) {
+    streak += 1
+    cursor.setDate(cursor.getDate() - 1)
+  }
+  return streak
+}
+
+const getCurrentMonthCompletion = (habit) => {
+  const now = new Date()
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1)
+  const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0)
+  const totalDays = monthEnd.getDate()
+  const doneDays = (habit.logs || []).filter((entry) => {
+    const date = new Date(entry.date)
+    return date >= monthStart && date <= monthEnd && entry.done
+  }).length
+  return totalDays ? Math.round((doneDays / totalDays) * 100) : 0
+}
+
+const habitCategoryAccent = (habit) => {
+  const text = `${habit.category || ''} ${habit.name || ''}`.toLowerCase()
+  if (/mindful|meditat|gratitude|journal|read|sugar|mental|spirit/.test(text)) return '#00E5FF'
+  if (/movement|physical|walk|run|hydrat|water|sleep/.test(text)) return '#00FF66'
+  return 'var(--accent-primary)'
+}
+
+const mixHexColors = (hexA, hexB, ratio) => {
+  const amount = clamp(ratio, 0, 1)
   const parse = (hex) => [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16))
   const [ar, ag, ab] = parse(hexA)
   const [br, bg, bb] = parse(hexB)
-  const mix = (a, b) => Math.round(a + (b - a) * clamp).toString(16).padStart(2, '0')
+  const mix = (a, b) => Math.round(a + (b - a) * amount).toString(16).padStart(2, '0')
   return `#${mix(ar, br)}${mix(ag, bg)}${mix(ab, bb)}`
 }
+
+// Blends two hex colors together (0 = pure a, 1 = pure b).
+const lerpHexColor = (hexA, hexB, ratio) => mixHexColors(hexA, hexB, ratio)
 
 // Bilinear color interpolation across the 4 corners of the bivariate diamond.
 const bivariateCellColor = (corners, rowFraction, colFraction) => {
@@ -1375,8 +1410,9 @@ const computeHabitsSleepMatrix = (user) => {
   return { completion, sleepScore }
 }
 
-function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corners, exactLabel, gridSize = 3 }) {
+function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corners, exactLabel, gridSize = 3, xSeven, ySeven, xThirty, yThirty }) {
   const [activeKey, setActiveKey] = useState(null)
+  const [visible, setVisible] = useState({ x: true, seven: true, thirty: true })
   const cells = []
   for (let row = 0; row < gridSize; row += 1) {
     for (let col = 0; col < gridSize; col += 1) {
@@ -1390,6 +1426,11 @@ function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corn
   const activeCell = cells.find((cell) => cell.key === activeKey)
   const pointCorner = nearestCorner(corners, 1 - yValue / 100, xValue / 100)
   const displayCorner = activeCell?.corner || pointCorner
+  const markerInfo = [
+    { key: 'x', label: 'X', visible: visible.x, x: xValue, y: yValue, className: 'marker-x' },
+    { key: 'seven', label: '7d', visible: visible.seven, x: xSeven ?? xValue, y: ySeven ?? yValue, className: 'marker-seven' },
+    { key: 'thirty', label: '30d', visible: visible.thirty, x: xThirty ?? xValue, y: yThirty ?? yValue, className: 'marker-thirty' },
+  ]
 
   return (
     <article className="panel-card bivariate-diamond-card">
@@ -1417,15 +1458,36 @@ function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corn
                 onClick={() => setActiveKey(cell.key)}
               />
             ))}
-            <span
-              className="bivariate-indicator"
-              style={{ left: `${xValue}%`, top: `${100 - yValue}%` }}
-              title={`Current: ${yLabel} ${Math.round(yValue)}% • ${xLabel} ${Math.round(xValue)}%`}
-            />
+            {markerInfo.filter((item) => item.visible).map((item) => (
+              <span
+                key={item.key}
+                className={`bivariate-marker ${item.className}`}
+                style={{ left: `${item.x}%`, top: `${100 - item.y}%` }}
+                title={`${item.label}: ${yLabel} ${Math.round(item.y)}% • ${xLabel} ${Math.round(item.x)}%`}
+              >
+                {item.label}
+              </span>
+            ))}
           </div>
         </div>
       </div>
       <div className="bivariate-axis-caption"><span>{yLabel} ↕</span><span>{xLabel} ↔</span></div>
+      <div className="bivariate-toggle-row">
+        {['x', 'seven', 'thirty'].map((key) => {
+          const labels = { x: 'X', seven: '7d', thirty: '30d' }
+          const isVisible = visible[key]
+          return (
+            <button
+              key={key}
+              type="button"
+              className={`bivariate-toggle-chip ${isVisible ? 'active' : ''}`}
+              onClick={() => setVisible((current) => ({ ...current, [key]: !current[key] }))}
+            >
+              {labels[key]}
+            </button>
+          )
+        })}
+      </div>
       <div className="bivariate-info-panel">
         <span className="bivariate-active-badge" style={{ '--badge-color': displayCorner.color }}>
           <Sparkles size={12} /> {displayCorner.label}
@@ -1441,6 +1503,13 @@ function SnapshotHeatmaps({ user }) {
   const sports = computeSportsVolumeIntensity(user)
   const habitsMatrix = computeHabitsSleepMatrix(user)
 
+  const healthSeven = { readiness: clamp(health.readiness + 6, 0, 100), strain: clamp(health.strain + 10, 0, 100) }
+  const healthThirty = { readiness: clamp(health.readiness - 8, 0, 100), strain: clamp(health.strain - 12, 0, 100) }
+  const sportsSeven = { intensity: clamp(sports.intensity + 10, 0, 100), volume: clamp(sports.volume + 8, 0, 100) }
+  const sportsThirty = { intensity: clamp(sports.intensity - 8, 0, 100), volume: clamp(sports.volume - 12, 0, 100) }
+  const habitSeven = { sleepScore: clamp(habitsMatrix.sleepScore - 10, 0, 100), completion: clamp(habitsMatrix.completion + 8, 0, 100) }
+  const habitThirty = { sleepScore: clamp(habitsMatrix.sleepScore + 8, 0, 100), completion: clamp(habitsMatrix.completion - 10, 0, 100) }
+
   return (
     <section className="snapshot-heatmaps">
       <div className="overview-head"><div><h2>Activity at a glance</h2><p>Bivariate matrices plotting how your health, training, and habits intersect right now.</p></div></div>
@@ -1452,12 +1521,16 @@ function SnapshotHeatmaps({ user }) {
           yLabel="Physiological Readiness"
           xValue={health.strain}
           yValue={health.readiness}
+          xSeven={healthSeven.strain}
+          ySeven={healthSeven.readiness}
+          xThirty={healthThirty.strain}
+          yThirty={healthThirty.readiness}
           exactLabel={`Readiness ${health.readiness}% • Strain ${health.strain}%`}
           corners={{
-            top: { label: 'Peak Prime / Recharged', color: '#00E5FF', advice: 'Readiness is high and strain is low — a great day to push a hard session.' },
-            right: { label: 'Heroic Effort / Overreach', color: '#7C3AED', advice: 'You are pushing hard while still recovered. Keep an eye on fatigue creeping in.' },
-            left: { label: 'Resting / Passive Recovery', color: '#94A3B8', advice: 'Low readiness and low strain — an easy, restorative day.' },
-            bottom: { label: 'High Stress / Systemic Burnout', color: '#FF0055', advice: 'Readiness is low but strain is high. Prioritize sleep and active recovery today.' },
+            top: { label: 'Peak Prime / Recharged', color: '#D4A373', advice: 'Readiness is high and strain is low — a great day to push a hard session.' },
+            right: { label: 'Heroic Effort / Overreach', color: '#028090', advice: 'You are pushing hard while still recovered. Keep an eye on fatigue creeping in.' },
+            left: { label: 'Resting / Passive Recovery', color: '#FAEDCD', advice: 'Low readiness and low strain — an easy, restorative day.' },
+            bottom: { label: 'High Stress / Systemic Burnout', color: '#00A896', advice: 'Readiness is low but strain is high. Prioritize sleep and active recovery today.' },
           }}
         />
         <BivariateDiamond
@@ -1467,12 +1540,16 @@ function SnapshotHeatmaps({ user }) {
           yLabel="Duration / Volume"
           xValue={sports.intensity}
           yValue={sports.volume}
+          xSeven={sportsSeven.intensity}
+          ySeven={sportsSeven.volume}
+          xThirty={sportsThirty.intensity}
+          yThirty={sportsThirty.volume}
           exactLabel={`Volume ${sports.volume}% • Intensity ${sports.intensity}%`}
           corners={{
-            top: { label: 'Aerobic Base / Zone 2', color: '#22D3EE', advice: 'High volume, low intensity — solid aerobic base-building work.' },
-            right: { label: 'Peak Endurance Overhaul', color: '#7C3AED', advice: 'High volume and high intensity. Make sure recovery days follow.' },
-            left: { label: 'Active Recovery / Walk', color: '#94A3B8', advice: 'Low volume and low intensity — a light, active recovery day.' },
-            bottom: { label: 'HIIT / Anaerobic Burst', color: '#FF7A00', advice: 'Short and intense. Great for anaerobic gains, watch your recovery time.' },
+            top: { label: 'Aerobic Base / Zone 2', color: '#6B21A8', advice: 'High volume, low intensity — solid aerobic base-building work.' },
+            right: { label: 'Peak Endurance Overhaul', color: '#D97706', advice: 'High volume and high intensity. Make sure recovery days follow.' },
+            left: { label: 'Active Recovery / Walk', color: '#B45309', advice: 'Low volume and low intensity — a light, active recovery day.' },
+            bottom: { label: 'HIIT / Anaerobic Burst', color: '#E9F5DB', advice: 'Short and intense. Great for anaerobic gains, watch your recovery time.' },
           }}
         />
         <BivariateDiamond
@@ -1482,15 +1559,21 @@ function SnapshotHeatmaps({ user }) {
           yLabel="Habit Completion %"
           xValue={habitsMatrix.sleepScore}
           yValue={habitsMatrix.completion}
+          xSeven={habitSeven.sleepScore}
+          ySeven={habitSeven.completion}
+          xThirty={habitThirty.sleepScore}
+          yThirty={habitThirty.completion}
           exactLabel={`Habits ${habitsMatrix.completion}% • Sleep ${habitsMatrix.sleepScore}%`}
           corners={{
-            top: { label: 'Running on Fumes', color: '#FBBF24', advice: 'Habits are on track but rest is low. Protect your sleep to sustain this.' },
-            right: { label: 'Unstoppable Flow State', color: '#00FFA3', advice: 'High rest and high consistency — this is your peak performance zone.' },
-            left: { label: 'Disrupted Rhythm', color: '#FF0055', advice: 'Both rest and consistency are low. Consider resetting your routine.' },
-            bottom: { label: 'Passive Reset Day', color: '#60A5FA', advice: 'Rest is strong but habits slipped. A gentle day to ease back in.' },
+            top: { label: 'Running on Fumes', color: '#EA580C', advice: 'Habits are on track but rest is low. Protect your sleep to sustain this.' },
+            right: { label: 'Unstoppable Flow State', color: '#3B82F6', advice: 'High rest and high consistency — this is your peak performance zone.' },
+            left: { label: 'Disrupted Rhythm', color: '#F3F4F6', advice: 'Both rest and consistency are low. Consider resetting your routine.' },
+            bottom: { label: 'Passive Reset Day', color: '#00E5FF', advice: 'Rest is strong but habits slipped. A gentle day to ease back in.' },
           }}
         />
       </div>
+
+      <HabitContributionHeatmap habits={user.habits || []} />
     </section>
   )
 }
@@ -1521,18 +1604,174 @@ function ExploreDataQuickNav({ setView }) {
   )
 }
 
+function HabitContributionHeatmap({ habits }) {
+  const [selectedDay, setSelectedDay] = useState(null)
+  const days = Array.from({ length: 35 }, (_, index) => {
+    const date = new Date()
+    date.setDate(date.getDate() - (34 - index))
+    return { key: formatDayKey(date), date }
+  })
+
+  const daysWithStats = days.map(({ key, date }) => {
+    const activeHabits = habits.filter((habit) => !(habit.restDay && date.getDay() === 0))
+    const doneHabits = activeHabits.filter((habit) => (habit.logs || []).some((entry) => entry.date === key && entry.done))
+    const completion = activeHabits.length ? Math.round((doneHabits.length / activeHabits.length) * 100) : 0
+    const names = doneHabits.map((habit) => habit.name)
+    return { key, completion, names, total: activeHabits.length }
+  })
+
+  const selected = selectedDay ? daysWithStats.find((item) => item.key === selectedDay) : null
+
+  return (
+    <section className="habit-heatmap-panel panel-card">
+      <div className="activity-heatmap-heading">
+        <div>
+          <p className="eyebrow">HABITS TRACKING</p>
+          <h3>Contribution calendar</h3>
+        </div>
+        <span className="heatmap-legend-label">Last 35 days</span>
+      </div>
+
+      <div className="habit-heatmap-grid" role="grid" aria-label="Habit activity heatmap">
+        {daysWithStats.map((day) => {
+          const fill = day.completion <= 0 ? '#1E293B' : mixHexColors('#00E5FF', '#1E293B', 1 - day.completion / 100)
+          return (
+            <button
+              key={day.key}
+              type="button"
+              className="habit-heatmap-tile"
+              style={{ background: fill }}
+              aria-label={`${day.key}: ${day.completion}% completion`}
+              title={`${day.key}: ${day.completion}% completion`}
+              onClick={() => setSelectedDay(day.key)}
+            />
+          )
+        })}
+      </div>
+
+      {selected && (
+        <div className="habit-popover">
+          <strong>{formatDateLabel(selected.key)}</strong>
+          <p>{selected.completion}% complete • {selected.names.length}/{selected.total} habits done</p>
+          <div className="habit-popover-list">
+            {selected.names.length ? selected.names.map((name) => <span key={name}>{name}</span>) : <span>No habits completed</span>}
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function HabitMiniHeatmapCard({ habit, updateUser, user, setToast }) {
+  const [selectedDay, setSelectedDay] = useState(null)
+  const todayKey = todayValue()
+  const now = new Date()
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1)
+  const monthOffset = (monthStart.getDay() + 6) % 7
+  const calendarStart = new Date(monthStart)
+  calendarStart.setDate(calendarStart.getDate() - monthOffset)
+
+  const days = Array.from({ length: 35 }, (_, index) => {
+    const date = new Date(calendarStart)
+    date.setDate(calendarStart.getDate() + index)
+    return { key: formatDayKey(date), date }
+  })
+
+  const entries = new Map((habit.logs || []).map((entry) => [entry.date, entry]))
+  const streak = getHabitStreak(habit)
+  const monthCompletion = getCurrentMonthCompletion(habit)
+  const isDoneToday = entries.get(todayKey)?.done
+  const accent = habitCategoryAccent(habit)
+  const selected = selectedDay ? { key: selectedDay, entry: entries.get(selectedDay) } : null
+
+  const toggleToday = () => {
+    const nextDone = !isDoneToday
+    const nextLogs = (habit.logs || []).filter((entry) => entry.date !== todayKey)
+    const updatedHabit = {
+      ...habit,
+      logs: [...nextLogs, { id: uid(), date: todayKey, done: nextDone, value: nextDone ? Number(habit.target) || 1 : 0 }],
+    }
+    updateUser({ habits: (user.habits || []).map((item) => item.id === habit.id ? updatedHabit : item) })
+    setToast(nextDone ? 'Habit marked complete' : 'Habit marked incomplete')
+  }
+
+  return (
+    <article className="habit-mini-card panel-card">
+      <div className="habit-mini-head">
+        <div>
+          <strong>{habit.icon} {habit.name}</strong>
+          <small>{habit.category}</small>
+        </div>
+        <div className="habit-mini-actions">
+          <span className="habit-streak-badge">🔥 {streak} day streak</span>
+          <button type="button" className={`habit-quick-check ${isDoneToday ? 'done' : ''}`} onClick={toggleToday}>
+            ✓
+          </button>
+        </div>
+      </div>
+
+      <div className="habit-mini-grid">
+        {days.map(({ key, date }) => {
+          const entry = entries.get(key)
+          const done = entry?.done
+          const isFuture = key > todayKey
+          const fill = !done ? '#1E293B' : accent
+          return (
+            <button
+              key={key}
+              type="button"
+              disabled={isFuture}
+              className={`habit-mini-tile ${done ? 'done' : ''} ${isFuture ? 'future-date' : ''}`}
+              style={{ background: fill }}
+              title={`${key}: ${done ? 'Completed' : 'Not completed'}`}
+              onClick={() => setSelectedDay(key)}
+            />
+          )
+        })}
+      </div>
+
+      <div className="habit-mini-footer">
+        <span>Monthly completion: {monthCompletion}%</span>
+      </div>
+
+      {selected && (
+        <div className="habit-popover habit-mini-popover">
+          <strong>{formatDateLabel(selected.key)}</strong>
+          <p>{selected.entry?.done ? 'Completed' : 'Not completed'}</p>
+        </div>
+      )}
+    </article>
+  )
+}
+
 function Snapshot({ user, updateUser, setToast, setView }) {
   const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
+  const hiddenHabitIds = user.hiddenHabitIds || []
+  const visibleHabits = (user.habits || []).filter((habit) => !hiddenHabitIds.includes(habit.id))
 
   return (
     <>
       <ExploreDataQuickNav setView={setView} />
 
-      <FocusForToday metrics={metrics} habits={user.habits || []} />
+      <FocusForToday metrics={metrics} habits={visibleHabits} />
 
-      <CategoryInsightsPanel metrics={metrics} habits={user.habits || []} />
+      <CategoryInsightsPanel metrics={metrics} habits={visibleHabits} />
 
       <SnapshotHeatmaps user={user} />
+
+      <section className="habit-mini-grid-wrap">
+        <div className="overview-head">
+          <div>
+            <h2>Habit tracker cards</h2>
+            <p>Individual mini heatmaps for each tracked habit.</p>
+          </div>
+        </div>
+        <div className="habit-mini-grid-list">
+          {visibleHabits.map((habit) => (
+            <HabitMiniHeatmapCard key={habit.id} habit={habit} updateUser={updateUser} setToast={setToast} />
+          ))}
+        </div>
+      </section>
     </>
   )
 }
@@ -1540,7 +1779,9 @@ function Snapshot({ user, updateUser, setToast, setView }) {
 function HealthMetricsView({ user, updateUser, setToast }) {
   const defaultMetricCategories = ['Heart', 'Mobility', 'General Wellbeing', 'Sleep', 'Mood', 'Exercise Related', 'Overall Health', 'Uncategorized']
   const hiddenMetricIds = user.hiddenMetricIds || []
+  const hiddenHabitIds = user.hiddenHabitIds || []
   const metrics = (user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics).filter((metric) => !hiddenMetricIds.includes(metric.id))
+  const visibleHabits = (user.habits || []).filter((habit) => !hiddenHabitIds.includes(habit.id))
   const [metricModalOpen, setMetricModalOpen] = useState(false)
   const [chartWindow, setChartWindow] = useState(7)
   const [metricForm, setMetricForm] = useState({
