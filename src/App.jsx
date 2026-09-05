@@ -2014,6 +2014,7 @@ function HealthMetricsView({ user, updateUser, setToast }) {
   const closeMetricModal = () => {
     setMetricModalOpen(false)
     setSelectedMetricId(null)
+    resetMetricForm()
   }
   const metricCategories = [...new Set([...defaultMetricCategories, ...metrics.map((metric) => metric.category).filter(Boolean)])]
 
@@ -2282,7 +2283,7 @@ function HealthMetricsView({ user, updateUser, setToast }) {
           <h2>Health metrics</h2>
           <p>Small, steady shifts create lasting momentum.</p>
         </div>
-        <button className="primary-button" onClick={() => setMetricModalOpen(true)}>
+        <button className="primary-button" onClick={() => { resetMetricForm(); setMetricModalOpen(true) }}>
           <Plus size={15} />
           Add custom metric
         </button>
