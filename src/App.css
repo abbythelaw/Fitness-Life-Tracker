@@ -1497,7 +1497,7 @@ textarea { resize: vertical; min-height: 120px; }
   overflow-y: auto;
   overflow-x: auto;
   overscroll-behavior: contain;
-  touch-action: pan-x pan-y;
+  touch-action: pan-x pan-y pinch-zoom;
   -webkit-overflow-scrolling: touch;
 }
 .journal-reader-header {
@@ -1771,7 +1771,7 @@ textarea { resize: vertical; min-height: 120px; }
   padding: 16px;
   z-index: 40;
   overflow: hidden;
-  touch-action: none;
+  touch-action: pan-x pan-y pinch-zoom;
   overscroll-behavior: contain;
 }
 /* Safety net so any modal child keeps clear of viewport/keyboard clipping. */
@@ -1780,7 +1780,7 @@ textarea { resize: vertical; min-height: 120px; }
   overflow-y: auto;
   overflow-x: auto;
   overscroll-behavior: contain;
-  touch-action: pan-x pan-y;
+  touch-action: pan-x pan-y pinch-zoom;
   -webkit-overflow-scrolling: touch;
 }
 .modal-card {
@@ -1789,7 +1789,7 @@ textarea { resize: vertical; min-height: 120px; }
   overflow-y: auto;
   overflow-x: auto;
   overscroll-behavior: contain;
-  touch-action: pan-x pan-y;
+  touch-action: pan-x pan-y pinch-zoom;
   -webkit-overflow-scrolling: touch;
   background: var(--panel);
   border: 1px solid var(--line);
@@ -1806,7 +1806,7 @@ textarea { resize: vertical; min-height: 120px; }
   flex: 0 1 auto;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
-  touch-action: pan-x pan-y;
+  touch-action: pan-x pan-y pinch-zoom;
   scrollbar-gutter: stable;
   background: linear-gradient(180deg, color-mix(in srgb, var(--panel) 96%, transparent), color-mix(in srgb, var(--panel-alt) 96%, transparent));
   color: var(--text);
@@ -2244,7 +2244,7 @@ html[data-mode='light'] .metric-detail-modal {
   display: flex;
   justify-content: flex-end;
   z-index: 50;
-  touch-action: none;
+  touch-action: pan-x pan-y pinch-zoom;
   overscroll-behavior: contain;
 }
 .custom-exercise-drawer {
@@ -2259,7 +2259,7 @@ html[data-mode='light'] .metric-detail-modal {
   overflow-y: auto;
   overflow-x: auto;
   overscroll-behavior: contain;
-  touch-action: pan-x pan-y;
+  touch-action: pan-x pan-y pinch-zoom;
   -webkit-overflow-scrolling: touch;
 }
 @keyframes slideInDrawer {
