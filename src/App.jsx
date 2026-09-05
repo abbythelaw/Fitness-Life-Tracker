@@ -2007,7 +2007,10 @@ function HealthMetricsView({ user, updateUser, setToast }) {
   const [selectedMetricId, setSelectedMetricId] = useState(null)
   const [entryEditor, setEntryEditor] = useState(null)
 
-  const closeMetricDetail = () => setSelectedMetricId(null)
+  const closeMetricDetail = () => {
+    setSelectedMetricId(null)
+    setEntryEditor(null)
+  }
   const closeMetricModal = () => {
     setMetricModalOpen(false)
     setSelectedMetricId(null)
@@ -2198,6 +2201,11 @@ function HealthMetricsView({ user, updateUser, setToast }) {
       if (metric.measurementType === 'scale') return Math.min(10, Math.max(0, Number(entryEditor.value) || 0))
       return Number(entryEditor.value)
     })()
+
+    if (metric.measurementType !== 'boolean' && !Number.isFinite(parsedValue)) {
+      setToast('Enter a valid number before saving.')
+      return
+    }
 
     const nextMetrics = metrics.map((item) => {
       if (item.id !== metric.id) return item
@@ -2563,24 +2571,25 @@ function HealthMetricsView({ user, updateUser, setToast }) {
               </button>
             </div>
 
-            <div className="calendar-strip expanded-calendar">
-              <div className="metric-mini-calendar-body large">
-                <div className="metric-mini-weekdays large" aria-hidden="true">
-                  {['M', 'T', 'W', 'Th', 'F', 'S', 'S'].map((label) => (
-                    <span key={`${selectedMetric.id}-weekday-${label}`}>{label}</span>
-                  ))}
+            {entryEditor && (
+              <div className="entry-editor">
+                <strong>{entryEditor.entryId ? 'Edit log entry' : 'Add entry'}</strong>
+                <div className="field-grid two-up">
+                  <label className="field-label">
+                    Date &amp; time
+                    <input type="datetime-local" step="1" value={entryEditor.date} onChange={(event) => setEntryEditor({ ...entryEditor, date: event.target.value })} />
+                  </label>
+                  <label className="field-label">
+                    Value
+                    <input type="text" value={entryEditor.value} onChange={(event) => setEntryEditor({ ...entryEditor, value: event.target.value })} autoFocus />
+                  </label>
                 </div>
-                <div className="metric-detail-grid">
-                  {getMetricHeatmap(selectedMetric).map((day) => (
-                    <span
-                      key={`${selectedMetric.id}-${day.key}`}
-                      className={`metric-square intensity-${day.intensity} ${day.isToday ? 'today' : ''}`}
-                      title={`${day.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`}
-                    />
-                  ))}
+                <div className="routine-actions-row">
+                  <button className="secondary-button" onClick={() => setEntryEditor(null)}>Cancel</button>
+                  <button className="primary-button" onClick={handleSaveMetricEntry}>Save update</button>
                 </div>
               </div>
-            </div>
+            )}
 
             <div className="metric-chart-wrap large">
               <ResponsiveContainer width="100%" height={240}>
@@ -2601,25 +2610,24 @@ function HealthMetricsView({ user, updateUser, setToast }) {
               </ResponsiveContainer>
             </div>
 
-            {entryEditor && (
-              <div className="entry-editor">
-                <strong>{entryEditor.entryId ? 'Edit log entry' : 'Add entry'}</strong>
-                <div className="field-grid two-up">
-                  <label className="field-label">
-                    Date &amp; time
-                    <input type="datetime-local" step="1" value={entryEditor.date} onChange={(event) => setEntryEditor({ ...entryEditor, date: event.target.value })} />
-                  </label>
-                  <label className="field-label">
-                    Value
-                    <input type="text" value={entryEditor.value} onChange={(event) => setEntryEditor({ ...entryEditor, value: event.target.value })} />
-                  </label>
+            <div className="calendar-strip expanded-calendar">
+              <div className="metric-mini-calendar-body large">
+                <div className="metric-mini-weekdays large" aria-hidden="true">
+                  {['M', 'T', 'W', 'Th', 'F', 'S', 'S'].map((label) => (
+                    <span key={`${selectedMetric.id}-weekday-${label}`}>{label}</span>
+                  ))}
                 </div>
-                <div className="routine-actions-row">
-                  <button className="secondary-button" onClick={() => setEntryEditor(null)}>Cancel</button>
-                  <button className="primary-button" onClick={handleSaveMetricEntry}>Save update</button>
+                <div className="metric-detail-grid">
+                  {getMetricHeatmap(selectedMetric).map((day) => (
+                    <span
+                      key={`${selectedMetric.id}-${day.key}`}
+                      className={`metric-square intensity-${day.intensity} ${day.isToday ? 'today' : ''}`}
+                      title={`${day.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`}
+                    />
+                  ))}
                 </div>
               </div>
-            )}
+            </div>
 
             <div className="log-list compact-list metric-log-list">
               {(selectedMetric.entries || []).slice().sort((a, b) => new Date(b.date) - new Date(a.date)).map((entry) => (
