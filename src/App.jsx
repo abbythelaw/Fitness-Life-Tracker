@@ -1367,6 +1367,7 @@ const getCurrentMonthCompletion = (habit) => {
 }
 
 const habitCategoryAccent = (habit) => {
+  if (habit.accentColor) return habit.accentColor
   const text = `${habit.category || ''} ${habit.name || ''}`.toLowerCase()
   if (/mindful|meditat|gratitude|journal|read|sugar|mental|spirit/.test(text)) return '#00E5FF'
   if (/movement|physical|walk|run|hydrat|water|sleep/.test(text)) return '#00FF66'
@@ -1549,7 +1550,7 @@ const getDomainDayCoordinates = (domain, user, dateInput) => {
   return getHabitsDayCoordinates(user, dateInput)
 }
 
-function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corners, exactLabel, gridSize = 3, xSeven, ySeven, xThirty, yThirty }) {
+function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corners, exactLabel, gridSize = 3, xSeven, ySeven, xThirty, yThirty, hasData = true }) {
   const [activeKey, setActiveKey] = useState(null)
   const [visible, setVisible] = useState({ x: true, seven: true, thirty: true })
   const cells = []
@@ -1577,12 +1578,15 @@ function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corn
         <div><p className="eyebrow">{eyebrow}</p><h3>{title}</h3></div>
         <span className="heatmap-legend-label">{exactLabel}</span>
       </div>
+      {!hasData && (
+        <p className="bivariate-sample-notice">No data logged yet for this matrix — showing an illustrative sample.</p>
+      )}
       <div className="bivariate-diamond-body">
-        <span className="bivariate-axis-label bivariate-axis-top" aria-hidden="true">↑</span>
-        <span className="bivariate-axis-label bivariate-axis-left" aria-hidden="true">←</span>
-        <span className="bivariate-axis-label bivariate-axis-right" aria-hidden="true">→</span>
-        <span className="bivariate-axis-label bivariate-axis-bottom" aria-hidden="true">↓</span>
-        <div className="bivariate-diamond-wrap">
+        <span className="bivariate-corner-label bivariate-corner-top" aria-hidden="true">{corners.top.label}</span>
+        <span className="bivariate-corner-label bivariate-corner-left" aria-hidden="true">{corners.left.label}</span>
+        <span className="bivariate-corner-label bivariate-corner-right" aria-hidden="true">{corners.right.label}</span>
+        <span className="bivariate-corner-label bivariate-corner-bottom" aria-hidden="true">{corners.bottom.label}</span>
+        <div className={`bivariate-diamond-wrap ${!hasData ? 'illustrative' : ''}`}>
           <div className="bivariate-diamond-grid" style={{ gridTemplateColumns: `repeat(${gridSize}, 1fr)`, gridTemplateRows: `repeat(${gridSize}, 1fr)` }}>
             {cells.map((cell) => (
               <button
@@ -1702,6 +1706,11 @@ function SnapshotHeatmaps({ user }) {
   const habitSeven = { sleepScore: clamp(habitsMatrix.sleepScore - 10, 0, 100), completion: clamp(habitsMatrix.completion + 8, 0, 100) }
   const habitThirty = { sleepScore: clamp(habitsMatrix.sleepScore + 8, 0, 100), completion: clamp(habitsMatrix.completion - 10, 0, 100) }
 
+  // Only trust the live/7d/30d markers once the user has actually logged something for that domain.
+  const healthHasData = (user.healthMetrics || []).some((metric) => (metric.entries || []).length > 0) || (user.workoutSessions || []).length > 0
+  const sportsHasData = (user.workoutSessions || []).length > 0
+  const habitsHasData = (user.habits || []).some((habit) => (habit.logs || []).length > 0)
+
   const healthCorners = {
     top: { label: 'Peak Prime / Recharged', color: '#D4A373', advice: 'Readiness is high and strain is low — a great day to push a hard session.' },
     right: { label: 'Heroic Effort / Overreach', color: '#028090', advice: 'You are pushing hard while still recovered. Keep an eye on fatigue creeping in.' },
@@ -1739,6 +1748,7 @@ function SnapshotHeatmaps({ user }) {
           yThirty={healthThirty.readiness}
           exactLabel={`Readiness ${health.readiness}% • Strain ${health.strain}%`}
           corners={healthCorners}
+          hasData={healthHasData}
         />
         <DomainMiniHeatmap user={user} domain="health" corners={healthCorners} xLabel="Strain" yLabel="Readiness" label="30-DAY HEALTH TREND" />
         </div>
@@ -1756,6 +1766,7 @@ function SnapshotHeatmaps({ user }) {
           yThirty={sportsThirty.volume}
           exactLabel={`Volume ${sports.volume}% • Intensity ${sports.intensity}%`}
           corners={sportsCorners}
+          hasData={sportsHasData}
         />
         <DomainMiniHeatmap user={user} domain="sports" corners={sportsCorners} xLabel="Intensity" yLabel="Volume" label="30-DAY TRAINING TREND" />
         </div>
@@ -1773,6 +1784,7 @@ function SnapshotHeatmaps({ user }) {
           yThirty={habitThirty.completion}
           exactLabel={`Habits ${habitsMatrix.completion}% • Sleep ${habitsMatrix.sleepScore}%`}
           corners={habitsCorners}
+          hasData={habitsHasData}
         />
         <DomainMiniHeatmap user={user} domain="mindfulness" corners={habitsCorners} xLabel="Sleep" yLabel="Completion" label="30-DAY HABITS TREND" />
         </div>
@@ -1810,6 +1822,7 @@ function ExploreDataQuickNav({ setView }) {
 
 function HabitMiniHeatmapCard({ habit, updateUser, user, setToast }) {
   const [selectedDay, setSelectedDay] = useState(null)
+  const [colorPickerOpen, setColorPickerOpen] = useState(false)
   const todayKey = todayValue()
   const now = new Date()
   const calendarStart = new Date(now)
@@ -1848,6 +1861,11 @@ function HabitMiniHeatmapCard({ habit, updateUser, user, setToast }) {
     setToast(nextDone ? 'Habit marked complete' : 'Habit marked incomplete')
   }
 
+  const setHabitAccentColor = (color) => {
+    updateUser({ habits: (user.habits || []).map((item) => item.id === habit.id ? { ...item, accentColor: color } : item) })
+    setColorPickerOpen(false)
+  }
+
   return (
     <article className="habit-mini-card panel-card">
       <div className="habit-mini-head">
@@ -1857,11 +1875,36 @@ function HabitMiniHeatmapCard({ habit, updateUser, user, setToast }) {
         </div>
         <div className="habit-mini-actions">
           <span className="habit-streak-badge">🔥 {streak} day streak</span>
+          <button
+            type="button"
+            className="habit-color-swatch-button"
+            style={{ '--swatch-color': accent }}
+            onClick={() => setColorPickerOpen((open) => !open)}
+            aria-label="Change contribution color"
+            title="Change contribution color"
+          >
+            <span className="habit-color-swatch-dot" />
+          </button>
           <button type="button" className={`habit-quick-check ${isDoneToday ? 'done' : ''}`} onClick={toggleToday}>
             ✓
           </button>
         </div>
       </div>
+
+      {colorPickerOpen && (
+        <div className="color-grid habit-color-picker">
+          {defaultMetricColors.map((color) => (
+            <button
+              key={color.value}
+              type="button"
+              className={`color-dot ${accent === color.value ? 'selected' : ''}`}
+              style={{ background: color.value }}
+              onClick={() => setHabitAccentColor(color.value)}
+              aria-label={color.name}
+            />
+          ))}
+        </div>
+      )}
 
       <div className="habit-mini-calendar">
         <div className="habit-mini-months" aria-hidden="true">
@@ -3964,7 +4007,7 @@ function HabitView({ user, updateUser, setToast }) {
           const isDoneToday = getHabitTodayEntry(habit)?.done
 
           return (
-            <article key={habit.id} className="habit-mini-tile" onClick={() => setSelectedHabitId(habit.id)}>
+            <article key={habit.id} className="habit-micro-tile" onClick={() => setSelectedHabitId(habit.id)}>
               <span className="habit-mini-icon">{habit.icon || '💪'}</span>
               <div className="habit-mini-info">
                 <strong>{habit.name}</strong>
