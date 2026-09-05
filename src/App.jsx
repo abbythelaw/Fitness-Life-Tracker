@@ -36,6 +36,7 @@ import {
 import './App.css'
 import exercisesSeed from './exercisesSeed'
 import { fromCloudProfile, isSupabaseConfigured, normalizeSupabaseExercise, supabase, toCloudProfile } from './supabaseClient'
+import { deletePhoto, deletePhotos, getPhotoUrl, savePhoto, savePhotos } from './lib/photoStore'
 
 const uid = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`
 
@@ -104,38 +105,43 @@ const addMinutes = (date, minutes) => new Date(date.getTime() + minutes * 60000)
 const estimateRoutineMinutes = (routine) => Math.max(5, Math.round((routine.exercises || [])
   .reduce((total, exercise) => total + (Math.max(1, Number(exercise.sets) || 3) * 1.5), 0)))
 
-const readFileAsDataUrl = (file) => new Promise((resolve, reject) => {
-  if (!file) { resolve(null); return }
-  const reader = new FileReader()
-  reader.onload = () => resolve(reader.result)
-  reader.onerror = reject
-  reader.readAsDataURL(file)
-})
-
-// Downscale + re-encode uploads so full-size phone photos don't blow past localStorage/Supabase row size limits.
-const compressImageFile = (file, maxDimension = 1600, quality = 0.82) => new Promise((resolve, reject) => {
-  if (!file) { resolve(null); return }
-  const reader = new FileReader()
-  reader.onerror = reject
-  reader.onload = () => {
-    const img = new Image()
-    img.onerror = reject
-    img.onload = () => {
-      const scale = Math.min(1, maxDimension / Math.max(img.width, img.height))
-      const width = Math.max(1, Math.round(img.width * scale))
-      const height = Math.max(1, Math.round(img.height * scale))
-      const canvas = document.createElement('canvas')
-      canvas.width = width
-      canvas.height = height
-      canvas.getContext('2d').drawImage(img, 0, 0, width, height)
-      resolve(canvas.toDataURL('image/jpeg', quality))
+// Resolves a photoRef stored in IndexedDB to an object URL, revoking it on change/unmount.
+function usePhotoUrl(photoRef) {
+  const [url, setUrl] = useState(null)
+  useEffect(() => {
+    let active = true
+    let objectUrl = null
+    if (!photoRef) {
+      setUrl(null)
+      return undefined
     }
-    img.src = String(reader.result || '')
-  }
-  reader.readAsDataURL(file)
-})
+    getPhotoUrl(photoRef).then((resolved) => {
+      if (!active) {
+        if (resolved) URL.revokeObjectURL(resolved)
+        return
+      }
+      objectUrl = resolved
+      setUrl(resolved)
+    })
+    return () => {
+      active = false
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [photoRef])
+  return url
+}
 
-const compressImageFiles = (files) => Promise.all(Array.from(files || []).map((file) => compressImageFile(file).catch(() => null)))
+function AsyncPhoto({ photoRef, alt = '', className, onClick, placeholder = null }) {
+  const url = usePhotoUrl(photoRef)
+  if (!url) return placeholder
+  return <img src={url} alt={alt} className={className} onClick={onClick} />
+}
+
+// Resolves a photoRef to a background-image style, for cover-image cards that can't use <img>.
+function usePhotoBackgroundStyle(photoRef, fallbackStyle) {
+  const url = usePhotoUrl(photoRef)
+  return url ? { backgroundImage: `url(${url})` } : fallbackStyle
+}
 
 const formatPace = (minutesPerKm) => {
   if (!Number.isFinite(minutesPerKm) || minutesPerKm <= 0) return '0:00'
@@ -403,7 +409,7 @@ const seedUser = (email, name = 'Alex Smith', guest = false) => ({
   theme: 'dark',
   themeFamily: 'ocean',
   themeMode: 'dark',
-  avatarUrl: '',
+  avatarPhotoRef: '',
   hiddenMetricIds: [],
   notes: seedNotes,
   routines: seedRoutines,
@@ -678,8 +684,8 @@ function App() {
         </div>
 
         <div className="profile-card">
-          {user.avatarUrl ? (
-            <img className="avatar avatar-image" src={user.avatarUrl} alt={user.name} />
+          {user.avatarPhotoRef ? (
+            <AsyncPhoto photoRef={user.avatarPhotoRef} alt={user.name} className="avatar avatar-image" placeholder={<div className="avatar">{user.name.split(' ').map((part) => part[0]).join('')}</div>} />
           ) : (
             <div className="avatar">{user.name.split(' ').map((part) => part[0]).join('')}</div>
           )}
@@ -3108,7 +3114,9 @@ function ExercisesView({ user, updateUser, setToast }) {
   }
 
   const deleteRoutine = (routineId) => {
-    updateUser({ routines: user.routines.filter((routine) => routine.id !== routineId) })
+    const routine = user.routines.find((item) => item.id === routineId)
+    if (routine?.photoRefs?.length) deletePhotos(routine.photoRefs)
+    updateUser({ routines: user.routines.filter((item) => item.id !== routineId) })
     if (editingId === routineId) {
       setDraft(emptyRoutine())
       setEditingId(null)
@@ -3120,27 +3128,28 @@ function ExercisesView({ user, updateUser, setToast }) {
     const list = Array.from(files || [])
     if (!list.length) return
     try {
-      const dataUrls = (await compressImageFiles(list)).filter(Boolean)
-      if (!dataUrls.length) throw new Error('No valid images')
+      const photoRefs = await savePhotos(list)
+      if (!photoRefs.length) throw new Error('No valid images')
       updateUser({
         routines: user.routines.map((routine) => {
           if (routine.id !== routineId) return routine
-          const photos = [...(routine.photos || []), ...dataUrls]
-          return { ...routine, photos, coverImage: routine.coverImage || dataUrls[0] }
+          const nextRefs = [...(routine.photoRefs || []), ...photoRefs]
+          return { ...routine, photoRefs: nextRefs, coverPhotoRef: routine.coverPhotoRef || photoRefs[0] }
         }),
       })
-      setToast(dataUrls.length > 1 ? `${dataUrls.length} photos added` : 'Photo added')
+      setToast(photoRefs.length > 1 ? `${photoRefs.length} photos added` : 'Photo added')
     } catch {
       setToast('Could not upload photo. Try a different image.')
     }
   }
 
-  const removeRoutinePhoto = (routineId, photoUrl) => {
+  const removeRoutinePhoto = (routineId, photoRef) => {
+    deletePhoto(photoRef)
     updateUser({
       routines: user.routines.map((routine) => {
         if (routine.id !== routineId) return routine
-        const photos = (routine.photos || []).filter((photo) => photo !== photoUrl)
-        return { ...routine, photos, coverImage: routine.coverImage === photoUrl ? (photos[0] || '') : routine.coverImage }
+        const photoRefs = (routine.photoRefs || []).filter((ref) => ref !== photoRef)
+        return { ...routine, photoRefs, coverPhotoRef: routine.coverPhotoRef === photoRef ? (photoRefs[0] || '') : routine.coverPhotoRef }
       }),
     })
   }
@@ -3355,15 +3364,15 @@ function ExercisesView({ user, updateUser, setToast }) {
           <div className="modal-backdrop routine-player-backdrop" onClick={() => setPlayerRoutineId(null)}>
             <div className="modal-card routine-player-modal" onClick={(event) => event.stopPropagation()}>
               <label className="routine-media-header">
-                {routine.coverImage ? <img src={routine.coverImage} alt="" /> : <span className="routine-media-placeholder">📷 Add a cover photo</span>}
+                <AsyncPhoto photoRef={routine.coverPhotoRef} alt="" placeholder={<span className="routine-media-placeholder">📷 Add a cover photo</span>} />
                 <input type="file" accept="image/*" multiple onChange={(event) => { handleRoutineCoverUpload(routine.id, event.target.files); event.target.value = '' }} />
               </label>
-              {routine.photos?.length > 1 && (
+              {routine.photoRefs?.length > 1 && (
                 <div className="photo-gallery-row" onClick={(event) => event.stopPropagation()}>
-                  {routine.photos.map((photo) => (
-                    <div key={photo} className={`photo-gallery-thumb ${routine.coverImage === photo ? 'active' : ''}`}>
-                      <img src={photo} alt="" onClick={() => updateUser({ routines: user.routines.map((item) => item.id === routine.id ? { ...item, coverImage: photo } : item) })} />
-                      <button type="button" className="photo-gallery-remove" onClick={() => removeRoutinePhoto(routine.id, photo)} aria-label="Remove photo">
+                  {routine.photoRefs.map((photoRef) => (
+                    <div key={photoRef} className={`photo-gallery-thumb ${routine.coverPhotoRef === photoRef ? 'active' : ''}`}>
+                      <AsyncPhoto photoRef={photoRef} alt="" onClick={() => updateUser({ routines: user.routines.map((item) => item.id === routine.id ? { ...item, coverPhotoRef: photoRef } : item) })} />
+                      <button type="button" className="photo-gallery-remove" onClick={() => removeRoutinePhoto(routine.id, photoRef)} aria-label="Remove photo">
                         <X size={10} />
                       </button>
                     </div>
@@ -3706,6 +3715,7 @@ function HabitView({ user, updateUser, setToast }) {
 
   const resetForm = () => {
     setForm({ id: uid(), name: '', category: 'Movement', measurementMode: 'binary', target: '', unit: 'minutes', icon: '💪', restDay: false, trackingType: 'boolean', targetValue: '', quickLog: false })
+    setSelectedHabitId((current) => (editingId ? editingId : current))
     setEditingId(null)
     setCustomCategory('')
     setShowForm(false)
@@ -3764,19 +3774,20 @@ function HabitView({ user, updateUser, setToast }) {
   const editHabit = (habit) => {
     setEditingId(habit.id)
     setShowForm(true)
+    setSelectedHabitId(null)
     setForm({
       ...habit,
       target: habit.target ?? '',
       unit: habit.unit || (habit.measurementMode === 'minutes' ? 'minutes' : habit.measurementMode === 'kms' ? 'kms' : 'count'),
       measurementMode: habit.trackingType === 'time' ? 'time' : habit.trackingType === 'numeric' ? 'numeric' : habit.measurementMode || 'binary',
     })
-    setSelectedHabitId(habit.id)
   }
 
   const deleteHabit = (habitId) => {
     const target = user.habits.find((habit) => habit.id === habitId)
     if (!target) return
 
+    if (target.photoRefs?.length) deletePhotos(target.photoRefs)
     updateUser({
       habits: user.habits.filter((habit) => habit.id !== habitId),
       logs: (user.logs || []).filter((entry) => entry.habitId !== habitId),
@@ -3932,27 +3943,28 @@ function HabitView({ user, updateUser, setToast }) {
     const list = Array.from(files || [])
     if (!list.length) return
     try {
-      const dataUrls = (await compressImageFiles(list)).filter(Boolean)
-      if (!dataUrls.length) throw new Error('No valid images')
+      const photoRefs = await savePhotos(list)
+      if (!photoRefs.length) throw new Error('No valid images')
       updateUser({
         habits: user.habits.map((habit) => {
           if (habit.id !== habitId) return habit
-          const photos = [...(habit.photos || []), ...dataUrls]
-          return { ...habit, photos, coverImage: habit.coverImage || dataUrls[0] }
+          const nextRefs = [...(habit.photoRefs || []), ...photoRefs]
+          return { ...habit, photoRefs: nextRefs, coverPhotoRef: habit.coverPhotoRef || photoRefs[0] }
         }),
       })
-      setToast(dataUrls.length > 1 ? `${dataUrls.length} photos added` : 'Photo added')
+      setToast(photoRefs.length > 1 ? `${photoRefs.length} photos added` : 'Photo added')
     } catch {
       setToast('Could not upload photo. Try a different image.')
     }
   }
 
-  const removeHabitPhoto = (habitId, photoUrl) => {
+  const removeHabitPhoto = (habitId, photoRef) => {
+    deletePhoto(photoRef)
     updateUser({
       habits: user.habits.map((habit) => {
         if (habit.id !== habitId) return habit
-        const photos = (habit.photos || []).filter((photo) => photo !== photoUrl)
-        return { ...habit, photos, coverImage: habit.coverImage === photoUrl ? (photos[0] || '') : habit.coverImage }
+        const photoRefs = (habit.photoRefs || []).filter((ref) => ref !== photoRef)
+        return { ...habit, photoRefs, coverPhotoRef: habit.coverPhotoRef === photoRef ? (photoRefs[0] || '') : habit.coverPhotoRef }
       }),
     })
   }
@@ -4134,6 +4146,9 @@ function HabitView({ user, updateUser, setToast }) {
                 <Pencil size={14} />
                 Edit habit
               </button>
+              <button className="icon-button subtle" onClick={() => deleteHabit(selectedHabit.id)} aria-label="Delete habit">
+                <Trash2 size={14} />
+              </button>
               <button className="icon-button subtle" onClick={() => setSelectedHabitId(null)} aria-label="Close habit detail">
                 <X size={15} />
               </button>
@@ -4141,15 +4156,15 @@ function HabitView({ user, updateUser, setToast }) {
           </div>
 
           <label className="habit-cover-uploader">
-            {selectedHabit.coverImage ? <img src={selectedHabit.coverImage} alt="" /> : <span>📷 Add a cover photo or icon</span>}
+            <AsyncPhoto photoRef={selectedHabit.coverPhotoRef} alt="" placeholder={<span>📷 Add a cover photo or icon</span>} />
             <input type="file" accept="image/*" multiple onChange={(event) => { handleHabitCoverUpload(selectedHabit.id, event.target.files); event.target.value = '' }} />
           </label>
-          {selectedHabit.photos?.length > 1 && (
+          {selectedHabit.photoRefs?.length > 1 && (
             <div className="photo-gallery-row">
-              {selectedHabit.photos.map((photo) => (
-                <div key={photo} className={`photo-gallery-thumb ${selectedHabit.coverImage === photo ? 'active' : ''}`}>
-                  <img src={photo} alt="" onClick={() => updateUser({ habits: user.habits.map((item) => item.id === selectedHabit.id ? { ...item, coverImage: photo } : item) })} />
-                  <button type="button" className="photo-gallery-remove" onClick={() => removeHabitPhoto(selectedHabit.id, photo)} aria-label="Remove photo">
+              {selectedHabit.photoRefs.map((photoRef) => (
+                <div key={photoRef} className={`photo-gallery-thumb ${selectedHabit.coverPhotoRef === photoRef ? 'active' : ''}`}>
+                  <AsyncPhoto photoRef={photoRef} alt="" onClick={() => updateUser({ habits: user.habits.map((item) => item.id === selectedHabit.id ? { ...item, coverPhotoRef: photoRef } : item) })} />
+                  <button type="button" className="photo-gallery-remove" onClick={() => removeHabitPhoto(selectedHabit.id, photoRef)} aria-label="Remove photo">
                     <X size={10} />
                   </button>
                 </div>
@@ -4847,10 +4862,46 @@ const emptyActivityForm = () => ({
   calories: '',
   avgHeartRate: '',
   notes: '',
-  coverImage: '',
+  coverPhotoRef: '',
   coverPreset: 0,
-  photos: [],
+  photoRefs: [],
 })
+
+function ActivitySessionCard({ session, onEdit, onDelete }) {
+  const category = getActivityCategory(session.category)
+  const distanceKm = Number(session.distanceKm) || 0
+  const durationMinutes = Number(session.durationMinutes) || Math.max(1, Math.round((session.durationMs || 0) / 60000))
+  const paceLabel = distanceKm > 0 ? `${formatPace(durationMinutes / distanceKm)}/km` : null
+  const coverStyle = usePhotoBackgroundStyle(session.coverPhotoRef, { background: ACTIVITY_COVER_PRESETS[session.coverPreset % ACTIVITY_COVER_PRESETS.length] || ACTIVITY_COVER_PRESETS[0] })
+
+  return (
+    <article className="activity-card panel-card">
+      <div className="activity-cover" style={coverStyle}>
+        <span className="activity-badge" style={{ background: category.color }}>{category.emoji} {category.label}</span>
+      </div>
+      <div className="activity-body">
+        <div className="activity-header-row">
+          <div>
+            <strong>{session.routineName}</strong>
+            <small>{formatDateLabel(session.endedAt || session.startedAt)}</small>
+          </div>
+          <div className="activity-actions">
+            <button className="icon-button subtle" onClick={onEdit} aria-label="Edit activity"><Pencil size={13} /></button>
+            <button className="icon-button subtle delete-session-button" onClick={onDelete} aria-label="Delete activity"><Trash2 size={13} /></button>
+          </div>
+        </div>
+        <div className="activity-stat-row">
+          <span><strong>{durationMinutes}</strong>min</span>
+          {distanceKm > 0 && <span><strong>{distanceKm}</strong>km</span>}
+          {paceLabel && <span><strong>{paceLabel}</strong>pace</span>}
+          {session.calories > 0 && <span><strong>{session.calories}</strong>kcal</span>}
+          {session.avgHeartRate > 0 && <span><strong>{session.avgHeartRate}</strong>bpm avg</span>}
+        </div>
+        {session.notes && <p className="activity-notes">{session.notes}</p>}
+      </div>
+    </article>
+  )
+}
 
 function SportsHubView({ user, updateUser, setToast }) {
   const sessions = user.workoutSessions || []
@@ -4876,9 +4927,9 @@ function SportsHubView({ user, updateUser, setToast }) {
       calories: session.calories || '',
       avgHeartRate: session.avgHeartRate || '',
       notes: session.notes || '',
-      coverImage: session.coverImage || '',
+      coverPhotoRef: session.coverPhotoRef || '',
       coverPreset: session.coverPreset || 0,
-      photos: session.photos || [],
+      photoRefs: session.photoRefs || [],
     })
     setModalOpen(true)
   }
@@ -4892,23 +4943,24 @@ function SportsHubView({ user, updateUser, setToast }) {
       return
     }
     try {
-      const dataUrls = (await compressImageFiles(files)).filter(Boolean)
-      if (!dataUrls.length) throw new Error('No valid images')
+      const photoRefs = await savePhotos(files)
+      if (!photoRefs.length) throw new Error('No valid images')
       setForm((current) => ({
         ...current,
-        photos: [...(current.photos || []), ...dataUrls],
-        coverImage: current.coverImage || dataUrls[0],
+        photoRefs: [...(current.photoRefs || []), ...photoRefs],
+        coverPhotoRef: current.coverPhotoRef || photoRefs[0],
       }))
-      setToast(dataUrls.length > 1 ? `${dataUrls.length} photos added` : 'Photo added')
+      setToast(photoRefs.length > 1 ? `${photoRefs.length} photos added` : 'Photo added')
     } catch {
       setToast('Could not upload photo. Try a different image.')
     }
   }
 
-  const removeFormPhoto = (photoUrl) => {
+  const removeFormPhoto = (photoRef) => {
+    deletePhoto(photoRef)
     setForm((current) => {
-      const photos = (current.photos || []).filter((photo) => photo !== photoUrl)
-      return { ...current, photos, coverImage: current.coverImage === photoUrl ? (photos[0] || '') : current.coverImage }
+      const photoRefs = (current.photoRefs || []).filter((ref) => ref !== photoRef)
+      return { ...current, photoRefs, coverPhotoRef: current.coverPhotoRef === photoRef ? (photoRefs[0] || '') : current.coverPhotoRef }
     })
   }
 
@@ -4935,9 +4987,9 @@ function SportsHubView({ user, updateUser, setToast }) {
       calories: Number(form.calories) || 0,
       avgHeartRate: Number(form.avgHeartRate) || 0,
       notes: form.notes.trim(),
-      coverImage: form.coverImage,
+      coverPhotoRef: form.coverPhotoRef,
       coverPreset: form.coverPreset,
-      photos: form.photos || [],
+      photoRefs: form.photoRefs || [],
       exercises: sessions.find((item) => item.id === form.id)?.exercises || [],
     }
 
@@ -4967,6 +5019,7 @@ function SportsHubView({ user, updateUser, setToast }) {
 
   const confirmDelete = () => {
     if (!deleteTarget) return
+    if (deleteTarget.photoRefs?.length) deletePhotos(deleteTarget.photoRefs)
     updateUser({
       workoutSessions: sessions.filter((item) => item.id !== deleteTarget.id),
       logs: (user.logs || []).filter((entry) => entry.id !== deleteTarget.logId),
@@ -4990,43 +5043,14 @@ function SportsHubView({ user, updateUser, setToast }) {
 
       <div className="activity-feed">
         {!sessions.length && <p className="empty-state">No activities logged yet. Tap "Log activity" to add your first session.</p>}
-        {sessions.map((session) => {
-          const category = getActivityCategory(session.category)
-          const distanceKm = Number(session.distanceKm) || 0
-          const durationMinutes = Number(session.durationMinutes) || Math.max(1, Math.round((session.durationMs || 0) / 60000))
-          const paceLabel = distanceKm > 0 ? `${formatPace(durationMinutes / distanceKm)}/km` : null
-
-          return (
-            <article key={session.id} className="activity-card panel-card">
-              <div
-                className="activity-cover"
-                style={session.coverImage ? { backgroundImage: `url(${session.coverImage})` } : { background: ACTIVITY_COVER_PRESETS[session.coverPreset % ACTIVITY_COVER_PRESETS.length] || ACTIVITY_COVER_PRESETS[0] }}
-              >
-                <span className="activity-badge" style={{ background: category.color }}>{category.emoji} {category.label}</span>
-              </div>
-              <div className="activity-body">
-                <div className="activity-header-row">
-                  <div>
-                    <strong>{session.routineName}</strong>
-                    <small>{formatDateLabel(session.endedAt || session.startedAt)}</small>
-                  </div>
-                  <div className="activity-actions">
-                    <button className="icon-button subtle" onClick={() => openEditModal(session)} aria-label="Edit activity"><Pencil size={13} /></button>
-                    <button className="icon-button subtle delete-session-button" onClick={() => setDeleteTarget(session)} aria-label="Delete activity"><Trash2 size={13} /></button>
-                  </div>
-                </div>
-                <div className="activity-stat-row">
-                  <span><strong>{durationMinutes}</strong>min</span>
-                  {distanceKm > 0 && <span><strong>{distanceKm}</strong>km</span>}
-                  {paceLabel && <span><strong>{paceLabel}</strong>pace</span>}
-                  {session.calories > 0 && <span><strong>{session.calories}</strong>kcal</span>}
-                  {session.avgHeartRate > 0 && <span><strong>{session.avgHeartRate}</strong>bpm avg</span>}
-                </div>
-                {session.notes && <p className="activity-notes">{session.notes}</p>}
-              </div>
-            </article>
-          )
-        })}
+        {sessions.map((session) => (
+          <ActivitySessionCard
+            key={session.id}
+            session={session}
+            onEdit={() => openEditModal(session)}
+            onDelete={() => setDeleteTarget(session)}
+          />
+        ))}
       </div>
 
       {modalOpen && (
@@ -5092,26 +5116,26 @@ function SportsHubView({ user, updateUser, setToast }) {
                     <button
                       type="button"
                       key={preset}
-                      className={`color-dot ${!form.coverImage && form.coverPreset === index ? 'selected' : ''}`}
+                      className={`color-dot ${!form.coverPhotoRef && form.coverPreset === index ? 'selected' : ''}`}
                       style={{ background: preset }}
-                      onClick={() => setForm({ ...form, coverPreset: index, coverImage: '' })}
+                      onClick={() => setForm({ ...form, coverPreset: index, coverPhotoRef: '' })}
                       aria-label={`Cover preset ${index + 1}`}
                     />
                   ))}
                 </div>
                 <div className="avatar-upload-row">
                   <button type="button" className="secondary-button" onClick={() => coverInputRef.current?.click()}>Upload photo</button>
-                  {form.coverImage && (
-                    <button type="button" className="ghost-button" onClick={() => setForm({ ...form, coverImage: '' })}>Remove photo</button>
+                  {form.coverPhotoRef && (
+                    <button type="button" className="ghost-button" onClick={() => setForm({ ...form, coverPhotoRef: '' })}>Remove photo</button>
                   )}
                   <input ref={coverInputRef} type="file" accept="image/*" multiple hidden onChange={handleCoverPick} />
                 </div>
-                {form.photos?.length > 1 && (
+                {form.photoRefs?.length > 1 && (
                   <div className="photo-gallery-row">
-                    {form.photos.map((photo) => (
-                      <div key={photo} className={`photo-gallery-thumb ${form.coverImage === photo ? 'active' : ''}`}>
-                        <img src={photo} alt="" onClick={() => setForm({ ...form, coverImage: photo })} />
-                        <button type="button" className="photo-gallery-remove" onClick={() => removeFormPhoto(photo)} aria-label="Remove photo">
+                    {form.photoRefs.map((photoRef) => (
+                      <div key={photoRef} className={`photo-gallery-thumb ${form.coverPhotoRef === photoRef ? 'active' : ''}`}>
+                        <AsyncPhoto photoRef={photoRef} alt="" onClick={() => setForm({ ...form, coverPhotoRef: photoRef })} />
+                        <button type="button" className="photo-gallery-remove" onClick={() => removeFormPhoto(photoRef)} aria-label="Remove photo">
                           <X size={10} />
                         </button>
                       </div>
@@ -5788,9 +5812,10 @@ function SettingsView({ user, updateUser, setToast, onSignOutAll }) {
       return
     }
     try {
-      const dataUrl = await compressImageFile(file, 640, 0.85)
-      if (!dataUrl) throw new Error('No image')
-      updateUser({ avatarUrl: dataUrl })
+      const photoRef = await savePhoto(file)
+      if (!photoRef) throw new Error('No image')
+      if (user.avatarPhotoRef) deletePhoto(user.avatarPhotoRef)
+      updateUser({ avatarPhotoRef: photoRef })
       setToast('Avatar updated')
     } catch {
       setToast('Could not upload photo. Try a different image.')
@@ -5819,8 +5844,8 @@ function SettingsView({ user, updateUser, setToast, onSignOutAll }) {
           <h3>Account details</h3>
 
           <div className="avatar-upload-row">
-            {user.avatarUrl ? (
-              <img className="avatar avatar-image avatar-large" src={user.avatarUrl} alt={user.name} />
+            {user.avatarPhotoRef ? (
+              <AsyncPhoto photoRef={user.avatarPhotoRef} alt={user.name} className="avatar avatar-image avatar-large" placeholder={<div className="avatar avatar-large">{user.name.split(' ').map((part) => part[0]).join('')}</div>} />
             ) : (
               <div className="avatar avatar-large">{user.name.split(' ').map((part) => part[0]).join('')}</div>
             )}
@@ -5828,8 +5853,8 @@ function SettingsView({ user, updateUser, setToast, onSignOutAll }) {
               <button type="button" className="secondary-button" onClick={() => avatarInputRef.current?.click()}>
                 Upload photo
               </button>
-              {user.avatarUrl && (
-                <button type="button" className="ghost-button" onClick={() => { updateUser({ avatarUrl: '' }); setToast('Avatar removed') }}>
+              {user.avatarPhotoRef && (
+                <button type="button" className="ghost-button" onClick={() => { deletePhoto(user.avatarPhotoRef); updateUser({ avatarPhotoRef: '' }); setToast('Avatar removed') }}>
                   Remove
                 </button>
               )}
