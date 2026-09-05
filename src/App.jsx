@@ -100,6 +100,18 @@ const inputToDurationMs = (value) => {
 
 const addMinutes = (date, minutes) => new Date(date.getTime() + minutes * 60000)
 
+// Rough estimate so routine mini-cards can show a "~N min" pill without a full session.
+const estimateRoutineMinutes = (routine) => Math.max(5, Math.round((routine.exercises || [])
+  .reduce((total, exercise) => total + (Math.max(1, Number(exercise.sets) || 3) * 1.5), 0)))
+
+const readFileAsDataUrl = (file) => new Promise((resolve, reject) => {
+  if (!file) { resolve(null); return }
+  const reader = new FileReader()
+  reader.onload = () => resolve(reader.result)
+  reader.onerror = reject
+  reader.readAsDataURL(file)
+})
+
 const formatPace = (minutesPerKm) => {
   if (!Number.isFinite(minutesPerKm) || minutesPerKm <= 0) return '0:00'
   const minutes = Math.floor(minutesPerKm)
@@ -1298,6 +1310,26 @@ const getHabitStreak = (habit) => {
   return streak
 }
 
+// Longest historical run of consecutive completed days, scanning back a full year.
+const getBestHabitStreak = (habit) => {
+  const doneDates = new Set((habit.logs || []).filter((entry) => entry.done).map((entry) => entry.date))
+  const cursor = new Date()
+  cursor.setDate(cursor.getDate() - 365)
+  let best = 0
+  let current = 0
+  for (let index = 0; index < 366; index += 1) {
+    if (doneDates.has(formatDayKey(cursor))) {
+      current += 1
+      best = Math.max(best, current)
+    } else {
+      current = 0
+    }
+    cursor.setDate(cursor.getDate() + 1)
+  }
+  return best
+}
+
+
 const getCurrentMonthCompletion = (habit) => {
   const now = new Date()
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1)
@@ -1498,6 +1530,29 @@ function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corn
   )
 }
 
+// 30-day GitHub-style micro heatmap rendered beneath a bivariate diamond for the same domain.
+function DomainMiniHeatmap({ user, domain, accent, label }) {
+  const days = recentDates(30)
+  return (
+    <div className="mini-heatmap-card">
+      <p className="eyebrow mini-heatmap-label">{label}</p>
+      <div className="mini-heatmap-grid">
+        {days.map((date) => {
+          const score = getActivityDayScore(user, date, domain)
+          return (
+            <span
+              key={formatDayKey(date)}
+              className="mini-heatmap-tile"
+              style={{ background: mixHexColors('#1E293B', accent, score) }}
+              title={`${new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(date)}: ${Math.round(score * 100)}%`}
+            />
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 function SnapshotHeatmaps({ user }) {
   const health = computeHealthReadinessStrain(user)
   const sports = computeSportsVolumeIntensity(user)
@@ -1514,6 +1569,7 @@ function SnapshotHeatmaps({ user }) {
     <section className="snapshot-heatmaps">
       <div className="overview-head"><div><h2>Activity at a glance</h2><p>Bivariate matrices plotting how your health, training, and habits intersect right now.</p></div></div>
       <div className="snapshot-heatmap-grid">
+        <div className="snapshot-heatmap-cell">
         <BivariateDiamond
           eyebrow="HEALTH & RECOVERY"
           title="Readiness × Strain"
@@ -1533,6 +1589,9 @@ function SnapshotHeatmaps({ user }) {
             bottom: { label: 'High Stress / Systemic Burnout', color: '#00A896', advice: 'Readiness is low but strain is high. Prioritize sleep and active recovery today.' },
           }}
         />
+        <DomainMiniHeatmap user={user} domain="health" accent="#3B82F6" label="30-DAY HEALTH TREND" />
+        </div>
+        <div className="snapshot-heatmap-cell">
         <BivariateDiamond
           eyebrow="SPORTS & WORKOUTS"
           title="Volume × Intensity"
@@ -1552,6 +1611,9 @@ function SnapshotHeatmaps({ user }) {
             bottom: { label: 'HIIT / Anaerobic Burst', color: '#E9F5DB', advice: 'Short and intense. Great for anaerobic gains, watch your recovery time.' },
           }}
         />
+        <DomainMiniHeatmap user={user} domain="sports" accent="#F59E0B" label="30-DAY TRAINING TREND" />
+        </div>
+        <div className="snapshot-heatmap-cell">
         <BivariateDiamond
           eyebrow="HABITS & MINDFULNESS"
           title="Consistency × Rest"
@@ -1571,6 +1633,8 @@ function SnapshotHeatmaps({ user }) {
             bottom: { label: 'Passive Reset Day', color: '#00E5FF', advice: 'Rest is strong but habits slipped. A gentle day to ease back in.' },
           }}
         />
+        <DomainMiniHeatmap user={user} domain="mindfulness" accent="#A855F7" label="30-DAY HABITS TREND" />
+        </div>
       </div>
 
     </section>
@@ -2418,6 +2482,7 @@ function ExercisesView({ user, updateUser, setToast }) {
   const [editingSession, setEditingSession] = useState(null)
   const [deletingSession, setDeletingSession] = useState(null)
   const [restUntil, setRestUntil] = useState(null)
+  const [playerRoutineId, setPlayerRoutineId] = useState(null)
   const [customExerciseForm, setCustomExerciseForm] = useState({
     name: '',
     category: 'Chest',
@@ -2822,6 +2887,14 @@ function ExercisesView({ user, updateUser, setToast }) {
     setToast('Routine deleted')
   }
 
+  const handleRoutineCoverUpload = async (routineId, file) => {
+    const dataUrl = await readFileAsDataUrl(file)
+    if (!dataUrl) return
+    updateUser({
+      routines: user.routines.map((routine) => (routine.id === routineId ? { ...routine, coverImage: dataUrl } : routine)),
+    })
+  }
+
   const updateExerciseForm = (field, value) => {
     setExerciseForm((current) => {
       const next = { ...current, [field]: value }
@@ -2981,15 +3054,16 @@ function ExercisesView({ user, updateUser, setToast }) {
         {user.routines.map((routine) => {
           const isActive = activeWorkout?.routineId === routine.id
           const elapsed = isActive ? Math.max(0, workoutNow - new Date(activeWorkout.startedAt)) : 0
+          const primaryCategory = routine.exercises[0]?.category || 'General'
 
           return (
-            <article key={routine.id} className="panel-card routine-card">
-              <div className="routine-header">
+            <article key={routine.id} className="routine-mini-card" onClick={() => setPlayerRoutineId(routine.id)}>
+              <div className="routine-mini-top">
                 <div>
                   <p className="eyebrow">ROUTINE</p>
                   <h3>{routine.name}</h3>
                 </div>
-                <div className="routine-actions">
+                <div className="routine-actions" onClick={(event) => event.stopPropagation()}>
                   <button className="icon-button subtle" onClick={() => editRoutine(routine)} aria-label="Edit routine">
                     <Pencil size={15} />
                   </button>
@@ -2999,7 +3073,53 @@ function ExercisesView({ user, updateUser, setToast }) {
                 </div>
               </div>
 
-                <div className="routine-timer-row">
+              <div className="routine-mini-meta">
+                <span className="routine-category-badge">{primaryCategory}</span>
+                <span className="routine-time-estimate">~{estimateRoutineMinutes(routine)} min</span>
+                {isActive && <span className="routine-status-badge live">Live • {formatDuration(elapsed)}</span>}
+              </div>
+
+              <button
+                type="button"
+                className="routine-launch-button"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  if (!isActive) beginWorkout(routine)
+                  setPlayerRoutineId(routine.id)
+                }}
+              >
+                {isActive ? 'Resume Workout ▶' : 'Start Workout ▶'}
+              </button>
+            </article>
+          )
+        })}
+      </div>
+
+      {playerRoutineId && (() => {
+        const routine = user.routines.find((item) => item.id === playerRoutineId)
+        if (!routine) return null
+        const isActive = activeWorkout?.routineId === routine.id
+        const elapsed = isActive ? Math.max(0, workoutNow - new Date(activeWorkout.startedAt)) : 0
+
+        return (
+          <div className="modal-backdrop routine-player-backdrop" onClick={() => setPlayerRoutineId(null)}>
+            <div className="modal-card routine-player-modal" onClick={(event) => event.stopPropagation()}>
+              <label className="routine-media-header">
+                {routine.coverImage ? <img src={routine.coverImage} alt="" /> : <span className="routine-media-placeholder">📷 Add a cover photo</span>}
+                <input type="file" accept="image/*" onChange={(event) => handleRoutineCoverUpload(routine.id, event.target.files?.[0])} />
+              </label>
+
+              <div className="metric-modal-header">
+                <div>
+                  <p className="eyebrow">ROUTINE PLAYER</p>
+                  <h3>{routine.name}</h3>
+                </div>
+                <button className="icon-button subtle" onClick={() => setPlayerRoutineId(null)} aria-label="Close routine player">
+                  <X size={16} />
+                </button>
+              </div>
+
+              <div className="routine-timer-row">
                 <span className="routine-status-badge">{isActive ? 'Live' : 'Ready'}</span>
                 <strong>{isActive ? formatDuration(elapsed) : `${routine.exercises.length} moves`}</strong>
               </div>
@@ -3095,10 +3215,10 @@ function ExercisesView({ user, updateUser, setToast }) {
                   </button>
                 )}
               </div>
-            </article>
-          )
-        })}
-      </div>
+            </div>
+          </div>
+        )
+      })()}
 
       <div className="panel-card workout-history-panel">
         <div className="panel-heading compact">
@@ -4114,6 +4234,15 @@ function FastingView({ user, updateUser, setToast }) {
   const activeStageIndex = Math.min(fastingStages.length - 1, fastingStages.findIndex((stage) => totalElapsedHours < stage.max) < 0 ? fastingStages.length - 1 : fastingStages.findIndex((stage) => totalElapsedHours < stage.max))
   const selectedStage = fastingStages.find((stage) => stage.key === selectedStageKey) || fastingStages[activeStageIndex]
 
+  // Four fasting phases, each with a glow gradient the timer card morphs into as the fast progresses.
+  const fastingPhases = [
+    { key: 'anabolic', name: 'Anabolic', label: 'Blood Sugar Stabilizing', min: 0, max: 12, colorA: '#1E293B', colorB: '#3B82F6' },
+    { key: 'ketosis', name: 'Ketosis', label: 'Fat Burning / Ketosis Activation', min: 12, max: 18, colorA: '#06B6D4', colorB: '#10B981' },
+    { key: 'autophagy', name: 'Autophagy', label: 'Deep Cellular Repair', min: 18, max: 24, colorA: '#8B5CF6', colorB: '#A855F7' },
+    { key: 'extended', name: 'Extended Cleanse', label: 'Deep Cleanse', min: 24, max: Infinity, colorA: '#F59E0B', colorB: '#FF5722' },
+  ]
+  const activePhase = fastingPhases.find((phase) => totalElapsedHours >= phase.min && totalElapsedHours < phase.max) || fastingPhases[0]
+
   return (
     <>
       <section className="overview-head">
@@ -4149,7 +4278,7 @@ function FastingView({ user, updateUser, setToast }) {
             </div>
           </div>
 
-          <div className="field-grid two-up">
+          <div className="fasting-datetime-row">
             <label className="field-label">
               Start Date & Time
               <input type="datetime-local" step="1" value={form.start} onChange={(event) => updateForm('start', event.target.value)} />
@@ -4217,7 +4346,10 @@ function FastingView({ user, updateUser, setToast }) {
             <input type="datetime-local" step="1" value={form.expectedEnd} readOnly disabled={form.type === 'standard'} />
           </label>
 
-          <div className="timer-shell">
+          <div className="timer-shell" style={{ '--phase-color-a': activePhase.colorA, '--phase-color-b': activePhase.colorB }}>
+            {activeFast && (
+              <span className="phase-status-badge">🔥 Active Phase: {activePhase.name}</span>
+            )}
             <div className="countdown-gauge" style={{ '--gauge-progress': `${elapsedProgress}%` }}>
               <svg viewBox="0 0 240 240" role="img" aria-label={`${elapsedProgress.toFixed(0)} percent of fast elapsed`}>
                 <defs>
