@@ -405,10 +405,26 @@ html[data-mode='dark'] .primary-button {
 }
 .mini-heatmap-tile {
   aspect-ratio: 1;
+  padding: 0;
+  margin: 0;
   border-radius: 3px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  transition: background 300ms ease;
+  cursor: pointer;
+  transition: background 300ms ease, transform .15s ease;
 }
+.mini-heatmap-tile:hover, .mini-heatmap-tile:focus-visible { transform: scale(1.2); z-index: 1; }
+.mini-heatmap-tile.active {
+  border-color: rgba(248, 250, 252, 0.7);
+  box-shadow: 0 0 0 1px rgba(248, 250, 252, 0.5);
+}
+.mini-heatmap-info {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.mini-heatmap-info small { color: var(--muted); font-size: 10px; }
 @media (max-width: 700px) {
   .mini-heatmap-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 }
@@ -1711,7 +1727,7 @@ textarea { resize: vertical; min-height: 120px; }
   align-items: center;
   justify-content: center;
   padding: 16px;
-  z-index: 50;
+  z-index: 40;
   overflow: hidden;
   touch-action: none;
   overscroll-behavior: contain;
@@ -2185,7 +2201,7 @@ html[data-mode='light'] .metric-detail-modal {
   background: rgba(15, 23, 42, 0.46);
   display: flex;
   justify-content: flex-end;
-  z-index: 40;
+  z-index: 50;
   touch-action: none;
   overscroll-behavior: contain;
 }

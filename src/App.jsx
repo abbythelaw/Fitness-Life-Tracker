@@ -286,6 +286,13 @@ const defaultMetricColors = [
   { name: 'Solar Amber', value: '#FFB800' },
   { name: 'Electric Blue', value: '#2563EB' },
   { name: 'Lime', value: '#00FF66' },
+  { name: 'Neon Violet', value: '#8B5CF6' },
+  { name: 'Rose Coral', value: '#F43F5E' },
+  { name: 'Electric Emerald', value: '#10B981' },
+  { name: 'Amber Flame', value: '#F59E0B' },
+  { name: 'Cyan Ice', value: '#06B6D4' },
+  { name: 'Hyper Lime', value: '#84CC16' },
+  { name: 'Indigo Surge', value: '#6366F1' },
 ]
 
 const seedHealthMetrics = [
@@ -1470,6 +1477,78 @@ const computeHabitsSleepMatrix = (user) => {
   return { completion, sleepScore }
 }
 
+// Latest sleep/energy-style score on or before a given day, for historical (non-"today") coordinate lookups.
+const findMetricScoreOnOrBefore = (metrics, pattern, dateInput, fallback) => {
+  const key = formatDayKey(dateInput)
+  const candidates = metrics.filter((metric) => pattern.test(`${metric.name} ${metric.category}`))
+  let best = null
+  candidates.forEach((metric) => {
+    const entries = (metric.entries || []).filter((entry) => formatDayKey(entry.date) <= key).sort((a, b) => new Date(b.date) - new Date(a.date))
+    if (entries[0] && (!best || new Date(entries[0].date) > new Date(best.entry.date))) best = { metric, entry: entries[0] }
+  })
+  return best ? normalizeMetricScore(best.metric, best.entry, fallback) : fallback
+}
+
+// Historical Readiness × Strain coordinates for one specific day (mirrors computeHealthReadinessStrain).
+const getHealthDayCoordinates = (user, dateInput) => {
+  const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
+  const sleepScore = findMetricScoreOnOrBefore(metrics, /sleep/i, dateInput, 60)
+  const energyScore = findMetricScoreOnOrBefore(metrics, /energy|mood|meditat/i, dateInput, 55)
+  const readiness = Math.round((sleepScore + energyScore) / 2)
+
+  const key = formatDayKey(dateInput)
+  const daySessions = (user.workoutSessions || []).filter((session) => formatDayKey(session.endedAt || session.startedAt) === key)
+  const activeCalories = daySessions.reduce((total, session) => total + (Number(session.caloriesBurned) || Math.round((Number(session.durationMinutes) || 0) * 7)), 0)
+  const targetCalories = Number(user.targetCalories) || 500
+  const strain = Math.min(100, Math.round((activeCalories / targetCalories) * 100))
+  return { x: strain, y: readiness }
+}
+
+// Historical Volume × Intensity coordinates for the 7-day window ending on a specific day.
+const getSportsDayCoordinates = (user, dateInput) => {
+  const windowKeys = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(dateInput)
+    date.setDate(date.getDate() - index)
+    return formatDayKey(date)
+  })
+  const sessions = (user.workoutSessions || []).filter((session) => windowKeys.includes(formatDayKey(session.endedAt || session.startedAt)))
+  const totalDuration = sessions.reduce((total, session) => total + (Number(session.durationMinutes) || Math.round((session.durationMs || 0) / 60000)), 0)
+  const volume = Math.min(100, Math.round((totalDuration / 180) * 100))
+  const intensityScores = sessions.map((session) => {
+    const durationMinutes = Number(session.durationMinutes) || Math.round((session.durationMs || 0) / 60000) || 1
+    const distanceKm = Number(session.distanceKm) || 0
+    if (distanceKm > 0) return Math.min(100, Math.round((distanceKm / (durationMinutes / 60)) * 10))
+    return 50
+  })
+  const intensity = intensityScores.length ? Math.round(intensityScores.reduce((total, value) => total + value, 0) / intensityScores.length) : 0
+  return { x: intensity, y: volume }
+}
+
+// Historical Habit Completion % × Sleep Quality coordinates for the 7-day window ending on a specific day.
+const getHabitsDayCoordinates = (user, dateInput) => {
+  const habits = user.habits || []
+  const windowKeys = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(dateInput)
+    date.setDate(date.getDate() - index)
+    return formatDayKey(date)
+  })
+  const eligibleLogs = habits.flatMap((habit) => windowKeys
+    .map((key) => ({ habit, key }))
+    .filter(({ habit: habitItem, key: entryKey }) => !(habitItem.restDay && new Date(`${entryKey}T00:00:00`).getDay() === 0)))
+  const doneCount = eligibleLogs.filter(({ habit: habitItem, key: entryKey }) => (habitItem.logs || []).some((entry) => entry.date === entryKey && entry.done)).length
+  const completion = eligibleLogs.length ? Math.round((doneCount / eligibleLogs.length) * 100) : 0
+
+  const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
+  const sleepScore = findMetricScoreOnOrBefore(metrics, /sleep|rem/i, dateInput, 60)
+  return { x: sleepScore, y: completion }
+}
+
+const getDomainDayCoordinates = (domain, user, dateInput) => {
+  if (domain === 'health') return getHealthDayCoordinates(user, dateInput)
+  if (domain === 'sports') return getSportsDayCoordinates(user, dateInput)
+  return getHabitsDayCoordinates(user, dateInput)
+}
+
 function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corners, exactLabel, gridSize = 3, xSeven, ySeven, xThirty, yThirty }) {
   const [activeKey, setActiveKey] = useState(null)
   const [visible, setVisible] = useState({ x: true, seven: true, thirty: true })
@@ -1559,24 +1638,54 @@ function BivariateDiamond({ eyebrow, title, xLabel, yLabel, xValue, yValue, corn
 }
 
 // 30-day GitHub-style micro heatmap rendered beneath a bivariate diamond for the same domain.
-function DomainMiniHeatmap({ user, domain, accent, label }) {
-  const days = recentDates(30)
+// Each tile is colored from the domain's own quadrant palette using that day's real X/Y coordinates,
+// so hovering or clicking a tile surfaces that specific day's score, quadrant tag, and color tier.
+function DomainMiniHeatmap({ user, domain, corners, xLabel, yLabel, label }) {
+  const [selectedKey, setSelectedKey] = useState(null)
+  const tiles = recentDates(30).map((date) => {
+    const { x, y } = getDomainDayCoordinates(domain, user, date)
+    const rowFraction = clamp(1 - y / 100, 0, 1)
+    const colFraction = clamp(x / 100, 0, 1)
+    return {
+      key: formatDayKey(date),
+      date,
+      x,
+      y,
+      color: bivariateCellColor(corners, rowFraction, colFraction),
+      corner: nearestCorner(corners, rowFraction, colFraction),
+    }
+  })
+  const selected = tiles.find((tile) => tile.key === selectedKey) || tiles[tiles.length - 1]
+
   return (
     <div className="mini-heatmap-card">
       <p className="eyebrow mini-heatmap-label">{label}</p>
       <div className="mini-heatmap-grid">
-        {days.map((date) => {
-          const score = getActivityDayScore(user, date, domain)
+        {tiles.map((tile) => {
+          const dateLabel = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(tile.date)
           return (
-            <span
-              key={formatDayKey(date)}
-              className="mini-heatmap-tile"
-              style={{ background: mixHexColors('#1E293B', accent, score) }}
-              title={`${new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(date)}: ${Math.round(score * 100)}%`}
+            <button
+              key={tile.key}
+              type="button"
+              className={`mini-heatmap-tile ${selectedKey === tile.key ? 'active' : ''}`}
+              style={{ background: tile.color }}
+              onMouseEnter={() => setSelectedKey(tile.key)}
+              onFocus={() => setSelectedKey(tile.key)}
+              onClick={() => setSelectedKey(tile.key)}
+              title={`${dateLabel}: ${yLabel} ${tile.y}% • ${xLabel} ${tile.x}% — ${tile.corner.label}`}
+              aria-label={`${dateLabel}: ${tile.corner.label}`}
             />
           )
         })}
       </div>
+      {selected && (
+        <div className="mini-heatmap-info">
+          <span className="bivariate-active-badge" style={{ '--badge-color': selected.corner.color }}>
+            <Sparkles size={11} /> {selected.corner.label}
+          </span>
+          <small>{new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(selected.date)} • {yLabel} {selected.y}% • {xLabel} {selected.x}%</small>
+        </div>
+      )}
     </div>
   )
 }
@@ -1592,6 +1701,25 @@ function SnapshotHeatmaps({ user }) {
   const sportsThirty = { intensity: clamp(sports.intensity - 8, 0, 100), volume: clamp(sports.volume - 12, 0, 100) }
   const habitSeven = { sleepScore: clamp(habitsMatrix.sleepScore - 10, 0, 100), completion: clamp(habitsMatrix.completion + 8, 0, 100) }
   const habitThirty = { sleepScore: clamp(habitsMatrix.sleepScore + 8, 0, 100), completion: clamp(habitsMatrix.completion - 10, 0, 100) }
+
+  const healthCorners = {
+    top: { label: 'Peak Prime / Recharged', color: '#D4A373', advice: 'Readiness is high and strain is low — a great day to push a hard session.' },
+    right: { label: 'Heroic Effort / Overreach', color: '#028090', advice: 'You are pushing hard while still recovered. Keep an eye on fatigue creeping in.' },
+    left: { label: 'Resting / Passive Recovery', color: '#FAEDCD', advice: 'Low readiness and low strain — an easy, restorative day.' },
+    bottom: { label: 'High Stress / Systemic Burnout', color: '#00A896', advice: 'Readiness is low but strain is high. Prioritize sleep and active recovery today.' },
+  }
+  const sportsCorners = {
+    top: { label: 'Aerobic Base / Zone 2', color: '#6B21A8', advice: 'High volume, low intensity — solid aerobic base-building work.' },
+    right: { label: 'Peak Endurance Overhaul', color: '#D97706', advice: 'High volume and high intensity. Make sure recovery days follow.' },
+    left: { label: 'Active Recovery / Walk', color: '#B45309', advice: 'Low volume and low intensity — a light, active recovery day.' },
+    bottom: { label: 'HIIT / Anaerobic Burst', color: '#E9F5DB', advice: 'Short and intense. Great for anaerobic gains, watch your recovery time.' },
+  }
+  const habitsCorners = {
+    top: { label: 'Running on Fumes', color: '#EA580C', advice: 'Habits are on track but rest is low. Protect your sleep to sustain this.' },
+    right: { label: 'Unstoppable Flow State', color: '#3B82F6', advice: 'High rest and high consistency — this is your peak performance zone.' },
+    left: { label: 'Disrupted Rhythm', color: '#F3F4F6', advice: 'Both rest and consistency are low. Consider resetting your routine.' },
+    bottom: { label: 'Passive Reset Day', color: '#00E5FF', advice: 'Rest is strong but habits slipped. A gentle day to ease back in.' },
+  }
 
   return (
     <section className="snapshot-heatmaps">
@@ -1610,14 +1738,9 @@ function SnapshotHeatmaps({ user }) {
           xThirty={healthThirty.strain}
           yThirty={healthThirty.readiness}
           exactLabel={`Readiness ${health.readiness}% • Strain ${health.strain}%`}
-          corners={{
-            top: { label: 'Peak Prime / Recharged', color: '#D4A373', advice: 'Readiness is high and strain is low — a great day to push a hard session.' },
-            right: { label: 'Heroic Effort / Overreach', color: '#028090', advice: 'You are pushing hard while still recovered. Keep an eye on fatigue creeping in.' },
-            left: { label: 'Resting / Passive Recovery', color: '#FAEDCD', advice: 'Low readiness and low strain — an easy, restorative day.' },
-            bottom: { label: 'High Stress / Systemic Burnout', color: '#00A896', advice: 'Readiness is low but strain is high. Prioritize sleep and active recovery today.' },
-          }}
+          corners={healthCorners}
         />
-        <DomainMiniHeatmap user={user} domain="health" accent="#3B82F6" label="30-DAY HEALTH TREND" />
+        <DomainMiniHeatmap user={user} domain="health" corners={healthCorners} xLabel="Strain" yLabel="Readiness" label="30-DAY HEALTH TREND" />
         </div>
         <div className="snapshot-heatmap-cell">
         <BivariateDiamond
@@ -1632,14 +1755,9 @@ function SnapshotHeatmaps({ user }) {
           xThirty={sportsThirty.intensity}
           yThirty={sportsThirty.volume}
           exactLabel={`Volume ${sports.volume}% • Intensity ${sports.intensity}%`}
-          corners={{
-            top: { label: 'Aerobic Base / Zone 2', color: '#6B21A8', advice: 'High volume, low intensity — solid aerobic base-building work.' },
-            right: { label: 'Peak Endurance Overhaul', color: '#D97706', advice: 'High volume and high intensity. Make sure recovery days follow.' },
-            left: { label: 'Active Recovery / Walk', color: '#B45309', advice: 'Low volume and low intensity — a light, active recovery day.' },
-            bottom: { label: 'HIIT / Anaerobic Burst', color: '#E9F5DB', advice: 'Short and intense. Great for anaerobic gains, watch your recovery time.' },
-          }}
+          corners={sportsCorners}
         />
-        <DomainMiniHeatmap user={user} domain="sports" accent="#F59E0B" label="30-DAY TRAINING TREND" />
+        <DomainMiniHeatmap user={user} domain="sports" corners={sportsCorners} xLabel="Intensity" yLabel="Volume" label="30-DAY TRAINING TREND" />
         </div>
         <div className="snapshot-heatmap-cell">
         <BivariateDiamond
@@ -1654,14 +1772,9 @@ function SnapshotHeatmaps({ user }) {
           xThirty={habitThirty.sleepScore}
           yThirty={habitThirty.completion}
           exactLabel={`Habits ${habitsMatrix.completion}% • Sleep ${habitsMatrix.sleepScore}%`}
-          corners={{
-            top: { label: 'Running on Fumes', color: '#EA580C', advice: 'Habits are on track but rest is low. Protect your sleep to sustain this.' },
-            right: { label: 'Unstoppable Flow State', color: '#3B82F6', advice: 'High rest and high consistency — this is your peak performance zone.' },
-            left: { label: 'Disrupted Rhythm', color: '#F3F4F6', advice: 'Both rest and consistency are low. Consider resetting your routine.' },
-            bottom: { label: 'Passive Reset Day', color: '#00E5FF', advice: 'Rest is strong but habits slipped. A gentle day to ease back in.' },
-          }}
+          corners={habitsCorners}
         />
-        <DomainMiniHeatmap user={user} domain="mindfulness" accent="#A855F7" label="30-DAY HABITS TREND" />
+        <DomainMiniHeatmap user={user} domain="mindfulness" corners={habitsCorners} xLabel="Sleep" yLabel="Completion" label="30-DAY HABITS TREND" />
         </div>
       </div>
 
@@ -2880,6 +2993,7 @@ function ExercisesView({ user, updateUser, setToast }) {
       name: routine.name,
       exercises: routine.exercises.map((exercise) => ({ ...exercise, id: exercise.id || uid() })),
     })
+    setShowRoutineForm(true)
   }
 
   const beginCompletedExerciseEdit = (routineId, exercise) => {
@@ -3148,9 +3262,14 @@ function ExercisesView({ user, updateUser, setToast }) {
                   <p className="eyebrow">ROUTINE PLAYER</p>
                   <h3>{routine.name}</h3>
                 </div>
-                <button className="icon-button subtle" onClick={() => setPlayerRoutineId(null)} aria-label="Close routine player">
-                  <X size={16} />
-                </button>
+                <div className="metric-modal-header-actions">
+                  <button className="icon-button subtle" onClick={() => { setPlayerRoutineId(null); editRoutine(routine) }} aria-label="Edit routine">
+                    <Pencil size={16} />
+                  </button>
+                  <button className="icon-button subtle" onClick={() => setPlayerRoutineId(null)} aria-label="Close routine player">
+                    <X size={16} />
+                  </button>
+                </div>
               </div>
 
               <div className="routine-timer-row">
@@ -3257,15 +3376,9 @@ function ExercisesView({ user, updateUser, setToast }) {
       <div className="panel-card workout-history-panel">
         <div className="panel-heading compact">
           <div>
-            <p className="eyebrow">ACTIVE SESSION</p>
-            <h3>Workout timer & history</h3>
+            <p className="eyebrow">HISTORY</p>
+            <h3>Workout history</h3>
           </div>
-        </div>
-
-        <div className="workout-live-box">
-          <span className="routine-status-badge">{activeWorkout ? 'IN PROGRESS' : 'IDLE'}</span>
-          <strong>{activeWorkout ? formatDuration(workoutNow - new Date(activeWorkout.startedAt)) : '00:00:00'}</strong>
-          <small>{activeWorkout ? activeWorkout.routineName : 'Start a routine to track the session'}</small>
         </div>
 
         <div className="workout-history-list">
@@ -3461,12 +3574,21 @@ function HabitView({ user, updateUser, setToast }) {
   })
   const [editingId, setEditingId] = useState(null)
   const [showForm, setShowForm] = useState(false)
-  const [selectedHabitId, setSelectedHabitId] = useState(user.habits?.[0]?.id ?? null)
+  const [selectedHabitId, setSelectedHabitId] = useState(null)
   const [customCategory, setCustomCategory] = useState('')
   const [loggingHabit, setLoggingHabit] = useState(null)
   const [loggingValue, setLoggingValue] = useState('')
 
   const categoryOptions = [...new Set([...habitCategories, ...user.habits.map((habit) => habit.category).filter(Boolean)])]
+
+  useEffect(() => {
+    if (!selectedHabitId) return undefined
+    const handleEscape = (event) => {
+      if (event.key === 'Escape') setSelectedHabitId(null)
+    }
+    window.addEventListener('keydown', handleEscape)
+    return () => window.removeEventListener('keydown', handleEscape)
+  }, [selectedHabitId])
 
   const resetForm = () => {
     setForm({ id: uid(), name: '', category: 'Movement', measurementMode: 'binary', target: '', unit: 'minutes', icon: '💪', restDay: false, trackingType: 'boolean', targetValue: '', quickLog: false })
@@ -3632,7 +3754,7 @@ function HabitView({ user, updateUser, setToast }) {
     const performed = user.habits.filter((habit) => (habit.logs || []).find((entry) => entry.date === dayKey)?.done).length
     return { dayKey, performed, total: user.habits.length }
   }
-  const selectedHabit = user.habits.find((habit) => habit.id === selectedHabitId) || user.habits[0] || null
+  const selectedHabit = selectedHabitId ? (user.habits.find((habit) => habit.id === selectedHabitId) || null) : null
 
   const getHabitTodayEntry = (habit) => {
     const todayKey = todayValue()
