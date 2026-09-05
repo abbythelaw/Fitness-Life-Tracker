@@ -396,6 +396,23 @@ function App() {
   const [session, setSession] = useState(() => isSupabaseConfigured ? null : read('fitlife-session', null))
   const [cloudReady, setCloudReady] = useState(!isSupabaseConfigured)
   const [syncState, setSyncState] = useState(isSupabaseConfigured ? 'connecting' : 'local')
+  // Sync happens continuously in the background, but the label only refreshes every 10s so it doesn't flicker.
+  const [displaySyncState, setDisplaySyncState] = useState(syncState)
+  const lastSyncLabelUpdate = useRef(0)
+  useEffect(() => {
+    const minInterval = 10000
+    const elapsed = Date.now() - lastSyncLabelUpdate.current
+    if (elapsed >= minInterval) {
+      lastSyncLabelUpdate.current = Date.now()
+      setDisplaySyncState(syncState)
+      return undefined
+    }
+    const timer = window.setTimeout(() => {
+      lastSyncLabelUpdate.current = Date.now()
+      setDisplaySyncState(syncState)
+    }, minInterval - elapsed)
+    return () => window.clearTimeout(timer)
+  }, [syncState])
   const [authMode, setAuthMode] = useState('login')
   const [view, setView] = useState('Snapshot')
   const [mobileNav, setMobileNav] = useState(false)
@@ -632,7 +649,7 @@ function App() {
           )}
           <div>
             <strong>{user.name}</strong>
-            <small>{user.guest ? 'Guest preview' : syncState === 'synced' ? 'Synced across devices' : syncState}</small>
+            <small>{user.guest ? 'Guest preview' : displaySyncState === 'synced' ? 'Synced across devices' : displaySyncState}</small>
           </div>
         </div>
 
@@ -1390,6 +1407,17 @@ const normalizeMetricScore = (metric, entry, fallback = 55) => {
   return Math.min(100, Math.round((Number(entry.value) / target) * 100))
 }
 
+// Actual logged sleep score (0-100) for a specific day, or null when nothing was logged that day.
+const getSleepScoreForDay = (user, dateInput) => {
+  const key = formatDayKey(dateInput)
+  const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
+  const sleepMetrics = metrics.filter((metric) => /sleep/i.test(`${metric.name} ${metric.category}`))
+  const scores = sleepMetrics
+    .map((metric) => (metric.entries || []).find((entry) => formatDayKey(entry.date) === key) && normalizeMetricScore(metric, (metric.entries || []).find((entry) => formatDayKey(entry.date) === key)))
+    .filter((value) => value !== null && value !== undefined)
+  return scores.length ? Math.round(scores.reduce((total, value) => total + value, 0) / scores.length) : null
+}
+
 // Y-Axis Readiness = (Sleep Score + Energy Score) / 2, X-Axis Strain = Active / Target calories.
 const computeHealthReadinessStrain = (user) => {
   const metrics = user.healthMetrics?.length ? user.healthMetrics : seedHealthMetrics
@@ -1904,10 +1932,16 @@ function HealthMetricsView({ user, updateUser, setToast }) {
   }
 
   const getMetricHeatmap = (metric) => {
-    const days = []
     const today = new Date()
-    for (let offset = 34; offset >= 0; offset -= 1) {
-      const date = new Date(today.getTime() - offset * 86400000)
+    // Align the grid to Monday so each column always lines up with the M/T/W/Th/F/S/S header.
+    const daysSinceMonday = (today.getDay() + 6) % 7
+    const gridStart = new Date(today)
+    gridStart.setDate(today.getDate() - daysSinceMonday - 28)
+
+    const days = []
+    for (let index = 0; index < 35; index += 1) {
+      const date = new Date(gridStart)
+      date.setDate(gridStart.getDate() + index)
       const key = formatDayKey(date)
       const entry = (metric.entries || []).find((item) => formatDayKey(item.date) === key)
       const raw = Number(entry?.value ?? 0)
@@ -1921,7 +1955,7 @@ function HealthMetricsView({ user, updateUser, setToast }) {
         else intensity = Math.min(4, Math.max(0, Math.round((raw / target) * 4)))
       }
 
-      days.push({ key, intensity, date, value: entry?.value ?? null, isToday: offset === 0 })
+      days.push({ key, intensity, date, value: entry?.value ?? null, isToday: key === formatDayKey(today) })
     }
     return days
   }
@@ -3560,20 +3594,17 @@ function HabitView({ user, updateUser, setToast }) {
     return dates
   }
 
-  const getHabitCompletionRate = (habit) => {
-    const days = getLastNDays(30)
-    const entries = new Map((habit.logs || []).map((entry) => [entry.date, entry]))
-    const total = days.filter((date) => !(habit.restDay && date.getDay() === 0)).length
-    const done = days.filter((date) => entries.get(formatDayKey(date))?.done).length
-    return total ? Math.round((done / total) * 100) : 0
-  }
-
   const buildTrendData = (habit) => {
     const days = getLastNDays(14)
     return days.map((date) => {
       const key = formatDayKey(date)
       const matched = (habit.logs || []).find((entry) => entry.date === key)
-      return { date: date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), value: matched?.done ? 1 : 0 }
+      const sleepScore = getSleepScoreForDay(user, date)
+      return {
+        date: date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+        value: matched?.done ? 1 : 0,
+        sleep: sleepScore === null ? null : sleepScore / 100,
+      }
     })
   }
 
@@ -3659,6 +3690,14 @@ function HabitView({ user, updateUser, setToast }) {
     updateUser({ habits: user.habits.map((habit) => habit.id === loggingHabit.id ? nextHabit : habit) })
     setLoggingHabit(null)
     setToast('Habit logged for today')
+  }
+
+  const handleHabitCoverUpload = async (habitId, file) => {
+    const dataUrl = await readFileAsDataUrl(file)
+    if (!dataUrl) return
+    updateUser({
+      habits: user.habits.map((habit) => (habit.id === habitId ? { ...habit, coverImage: dataUrl } : habit)),
+    })
   }
 
   return (
@@ -3799,138 +3838,79 @@ function HabitView({ user, updateUser, setToast }) {
 
       <div className="habit-grid">
         {user.habits.map((habit) => {
-          const completionRate = getHabitCompletionRate(habit)
-          const latest = (habit.logs || []).slice().sort((a, b) => new Date(b.date) - new Date(a.date))[0]
-          const latestStatus = latest?.done ? 'Complete' : 'Pending'
+          const streak = getHabitStreak(habit)
+          const isDoneToday = getHabitTodayEntry(habit)?.done
 
           return (
-            <article key={habit.id} className="habit-card panel-card" onClick={() => setSelectedHabitId(habit.id)}>
-              <div className="habit-header-row">
-                <div className="habit-title-wrap">
-                  <div>
-                    <strong>{habit.name}</strong>
-                    <small>{habit.category}</small>
-                  </div>
-                </div>
-                <div className="habit-header-actions">
-                  <div className="habit-status-pill">{latestStatus}</div>
-                  <button
-                    type="button"
-                    className={`metric-quick-toggle ${getHabitTodayEntry(habit)?.done ? 'done' : ''}`}
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      quickLogHabit(habit.id)
-                    }}
-                  >
-                    {getHabitTodayEntry(habit)?.done ? 'Completed Today' : 'Log Today'}
-                  </button>
-                </div>
+            <article key={habit.id} className="habit-mini-tile" onClick={() => setSelectedHabitId(habit.id)}>
+              <span className="habit-mini-icon">{habit.icon || '💪'}</span>
+              <div className="habit-mini-info">
+                <strong>{habit.name}</strong>
+                <span className="habit-mini-streak">🔥 {streak} Days</span>
               </div>
-
-              <div className="habit-meta-row">
-                <span>30-day completion: {completionRate}%</span>
-                <span>{(habit.trackingType || 'boolean') === 'time' ? `Target ${habit.targetValue || habit.target || '--'}` : (habit.trackingType || 'boolean') === 'numeric' ? `${habit.targetValue || habit.target || 0} ${habit.unit || 'units'} target` : 'Daily check-in'}</span>
-              </div>
-
-              <div className="habit-grid-months" aria-hidden="true">
-                {visibleMonthLabels.map((month) => <span key={`${habit.id}-${month.key}`}>{month.label}</span>)}
-              </div>
-              <div className="habit-grid-axis-labels" aria-hidden="true">
-                {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((label, index) => <span key={`${habit.id}-axis-${index}`}>{label}</span>)}
-              </div>
-              <div className="habit-contribution-grid">
-                {contributionDays.map((date) => {
-                  const key = formatDayKey(date)
-                  const entry = (habit.logs || []).find((item) => item.date === key)
-                  const done = entry?.done
-                  const isToday = key === todayValue()
-                  const isOutsideMonth = date.getMonth() !== calendarMonthStart.getMonth()
-                  const isFuture = key > todayValue()
-                  const dateLabel = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(date)
-                  const statusLabel = done ? `Completed${entry?.value ? ` • ${entry.value} ${habit.unit || ''}` : ''}` : 'Not completed'
-                  return (
-                    <button
-                      key={`${habit.id}-${key}`}
-                      type="button"
-                      disabled={isFuture}
-                      className={`day-box contribution-box ${done ? 'done' : ''} ${isToday ? 'today' : ''} ${isOutsideMonth ? 'outside-month' : ''} ${isFuture ? 'future-date' : ''}`}
-                      onClick={(event) => { event.stopPropagation(); toggleHabitDay(habit.id, key) }}
-                      title={`${dateLabel}: ${statusLabel}`}
-                      aria-label={`${dateLabel}: ${statusLabel}`}
-                    >
-                      <span className="mini-month">{new Intl.DateTimeFormat('en-US', { month: 'short' }).format(date).toUpperCase()}</span>
-                      <span className="mini-day">{String(date.getDate())}</span>
-                      <span className="habit-tooltip" role="tooltip">{dateLabel}<br />{statusLabel}</span>
-                    </button>
-                  )
-                })}
-              </div>
-
-              <div className="habit-trend-card">
-                <div className="habit-trend-header">
-                  <span>Latest completion</span>
-                  <div className="mini-actions">
-                    <button className="icon-button subtle" onClick={(event) => { event.stopPropagation(); editHabit(habit) }} aria-label="Edit habit">
-                      <Pencil size={14} />
-                    </button>
-                    <button className="icon-button subtle" onClick={(event) => { event.stopPropagation(); deleteHabit(habit.id) }} aria-label="Delete habit">
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                </div>
-                <ResponsiveContainer width="100%" height={90}>
-                  <LineChart data={buildTrendData(habit)}>
-                    <Line type="monotone" dataKey="value" stroke="var(--chart-cyan)" strokeWidth={2} dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-
-              <div className="seven-day-row">
-                {getLastNDays(7).map((date) => {
-                  const key = formatDayKey(date)
-                  const checked = (habit.logs || []).find((entry) => entry.date === key)?.done
-                  const tooltip = new Intl.DateTimeFormat('en-US', {
-                    weekday: 'long',
-                    month: 'short',
-                    day: 'numeric',
-                    year: 'numeric',
-                  }).format(date)
-
-                  const weekdayLabel = new Intl.DateTimeFormat('en-US', { weekday: 'short' }).format(date)
-                  const shortLabel = weekdayLabel === 'Thu' ? 'Th' : weekdayLabel
-
-                  return (
-                    <div key={`${habit.id}-day-${key}`} className="mini-calendar-stack">
-                      <button
-                        className={`day-box ${checked ? 'done' : ''} ${key === todayValue() ? 'today' : ''}`}
-                        onClick={(event) => { event.stopPropagation(); toggleHabitDay(habit.id, key) }}
-                        title={tooltip}
-                        aria-label={tooltip}
-                      >
-                        <span className="mini-month">{new Intl.DateTimeFormat('en-US', { month: 'short' }).format(date).toUpperCase()}</span>
-                        <span className="mini-day">{String(date.getDate())}</span>
-                      </button>
-                      <span className="mini-weekday-label">{shortLabel}</span>
-                    </div>
-                  )
-                })}
-              </div>
+              <button
+                type="button"
+                className={`habit-mini-toggle ${isDoneToday ? 'done' : ''}`}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  quickLogHabit(habit.id)
+                }}
+                aria-label={isDoneToday ? `Mark ${habit.name} incomplete for today` : `Mark ${habit.name} complete for today`}
+              >
+                <span className="habit-mini-toggle-dot" />
+              </button>
             </article>
           )
         })}
       </div>
 
       {selectedHabit && (
-        <div className="panel-card detail-card">
+        <div className="modal-backdrop habit-detail-backdrop" onClick={() => setSelectedHabitId(null)}>
+          <div className="panel-card detail-card modal-card habit-detail-modal" onClick={(event) => event.stopPropagation()}>
           <div className="panel-heading compact">
             <div>
               <p className="eyebrow">DETAIL VIEW</p>
               <h3>{selectedHabit.name}</h3>
             </div>
-            <button className="ghost-button" onClick={() => editHabit(selectedHabit)}>
-              <Pencil size={14} />
-              Edit habit
-            </button>
+            <div className="habit-header-actions">
+              <button className="ghost-button" onClick={() => editHabit(selectedHabit)}>
+                <Pencil size={14} />
+                Edit habit
+              </button>
+              <button className="icon-button subtle" onClick={() => setSelectedHabitId(null)} aria-label="Close habit detail">
+                <X size={15} />
+              </button>
+            </div>
+          </div>
+
+          <label className="habit-cover-uploader">
+            {selectedHabit.coverImage ? <img src={selectedHabit.coverImage} alt="" /> : <span>📷 Add a cover photo or icon</span>}
+            <input type="file" accept="image/*" onChange={(event) => handleHabitCoverUpload(selectedHabit.id, event.target.files?.[0])} />
+          </label>
+
+          <div className="habit-stat-row">
+            <div><small>MONTHLY %</small><strong>{getCurrentMonthCompletion(selectedHabit)}%</strong></div>
+            <div><small>BEST STREAK</small><strong>🔥 {getBestHabitStreak(selectedHabit)} Days</strong></div>
+            <div><small>TARGET FREQUENCY</small><strong>{selectedHabit.restDay ? 'Daily (Sundays off)' : 'Daily'}</strong></div>
+          </div>
+
+          <div className="mini-heatmap-card habit-30day-heatmap">
+            <p className="eyebrow mini-heatmap-label">30-DAY HISTORY</p>
+            <div className="mini-heatmap-grid">
+              {getLastNDays(30).map((date) => {
+                const key = formatDayKey(date)
+                const done = (selectedHabit.logs || []).find((entry) => entry.date === key)?.done
+                const accent = habitCategoryAccent(selectedHabit)
+                return (
+                  <span
+                    key={`${selectedHabit.id}-30d-${key}`}
+                    className="mini-heatmap-tile"
+                    style={{ background: mixHexColors('#1E293B', accent.startsWith('var') ? '#00E5FF' : accent, done ? 1 : 0) }}
+                    title={`${formatDateLabel(date)}: ${done ? 'Completed' : 'Not completed'}`}
+                  />
+                )
+              })}
+            </div>
           </div>
 
           <div className="detail-grid">
@@ -3959,7 +3939,7 @@ function HabitView({ user, updateUser, setToast }) {
           </div>
 
           <div className="insight-chart-wrap">
-            <h4>Dual-axis trend comparison</h4>
+            <h4>Habit completion vs. sleep quality</h4>
             <ResponsiveContainer width="100%" height={200}>
               <LineChart data={buildTrendData(selectedHabit)}>
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
@@ -3968,9 +3948,10 @@ function HabitView({ user, updateUser, setToast }) {
                 <Tooltip />
                 <Legend />
                 <Line type="monotone" dataKey="value" name={selectedHabit.name} stroke="var(--chart-cyan)" strokeWidth={2} />
-                <Line type="monotone" dataKey="value" name="Sleep quality" stroke="var(--chart-violet)" strokeWidth={2} strokeDasharray="6 6" />
+                <Line type="monotone" dataKey="sleep" name="Sleep quality" stroke="var(--chart-violet)" strokeWidth={2} strokeDasharray="6 6" connectNulls />
               </LineChart>
             </ResponsiveContainer>
+          </div>
           </div>
         </div>
       )}
