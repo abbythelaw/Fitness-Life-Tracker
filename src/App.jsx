@@ -112,6 +112,31 @@ const readFileAsDataUrl = (file) => new Promise((resolve, reject) => {
   reader.readAsDataURL(file)
 })
 
+// Downscale + re-encode uploads so full-size phone photos don't blow past localStorage/Supabase row size limits.
+const compressImageFile = (file, maxDimension = 1600, quality = 0.82) => new Promise((resolve, reject) => {
+  if (!file) { resolve(null); return }
+  const reader = new FileReader()
+  reader.onerror = reject
+  reader.onload = () => {
+    const img = new Image()
+    img.onerror = reject
+    img.onload = () => {
+      const scale = Math.min(1, maxDimension / Math.max(img.width, img.height))
+      const width = Math.max(1, Math.round(img.width * scale))
+      const height = Math.max(1, Math.round(img.height * scale))
+      const canvas = document.createElement('canvas')
+      canvas.width = width
+      canvas.height = height
+      canvas.getContext('2d').drawImage(img, 0, 0, width, height)
+      resolve(canvas.toDataURL('image/jpeg', quality))
+    }
+    img.src = String(reader.result || '')
+  }
+  reader.readAsDataURL(file)
+})
+
+const compressImageFiles = (files) => Promise.all(Array.from(files || []).map((file) => compressImageFile(file).catch(() => null)))
+
 const formatPace = (minutesPerKm) => {
   if (!Number.isFinite(minutesPerKm) || minutesPerKm <= 0) return '0:00'
   const minutes = Math.floor(minutesPerKm)
@@ -551,7 +576,11 @@ function App() {
   }, [session, cloudReady, user?.updatedAt])
 
   useEffect(() => {
-    localStorage.setItem('fitlife-users', JSON.stringify(users))
+    try {
+      localStorage.setItem('fitlife-users', JSON.stringify(users))
+    } catch {
+      setToast('Local storage is full — photos may not save. Try removing some photos.')
+    }
   }, [users])
 
   const lastSavedUser = useRef(null)
@@ -3087,11 +3116,32 @@ function ExercisesView({ user, updateUser, setToast }) {
     setToast('Routine deleted')
   }
 
-  const handleRoutineCoverUpload = async (routineId, file) => {
-    const dataUrl = await readFileAsDataUrl(file)
-    if (!dataUrl) return
+  const handleRoutineCoverUpload = async (routineId, files) => {
+    const list = Array.from(files || [])
+    if (!list.length) return
+    try {
+      const dataUrls = (await compressImageFiles(list)).filter(Boolean)
+      if (!dataUrls.length) throw new Error('No valid images')
+      updateUser({
+        routines: user.routines.map((routine) => {
+          if (routine.id !== routineId) return routine
+          const photos = [...(routine.photos || []), ...dataUrls]
+          return { ...routine, photos, coverImage: routine.coverImage || dataUrls[0] }
+        }),
+      })
+      setToast(dataUrls.length > 1 ? `${dataUrls.length} photos added` : 'Photo added')
+    } catch {
+      setToast('Could not upload photo. Try a different image.')
+    }
+  }
+
+  const removeRoutinePhoto = (routineId, photoUrl) => {
     updateUser({
-      routines: user.routines.map((routine) => (routine.id === routineId ? { ...routine, coverImage: dataUrl } : routine)),
+      routines: user.routines.map((routine) => {
+        if (routine.id !== routineId) return routine
+        const photos = (routine.photos || []).filter((photo) => photo !== photoUrl)
+        return { ...routine, photos, coverImage: routine.coverImage === photoUrl ? (photos[0] || '') : routine.coverImage }
+      }),
     })
   }
 
@@ -3306,8 +3356,20 @@ function ExercisesView({ user, updateUser, setToast }) {
             <div className="modal-card routine-player-modal" onClick={(event) => event.stopPropagation()}>
               <label className="routine-media-header">
                 {routine.coverImage ? <img src={routine.coverImage} alt="" /> : <span className="routine-media-placeholder">📷 Add a cover photo</span>}
-                <input type="file" accept="image/*" onChange={(event) => handleRoutineCoverUpload(routine.id, event.target.files?.[0])} />
+                <input type="file" accept="image/*" multiple onChange={(event) => { handleRoutineCoverUpload(routine.id, event.target.files); event.target.value = '' }} />
               </label>
+              {routine.photos?.length > 1 && (
+                <div className="photo-gallery-row" onClick={(event) => event.stopPropagation()}>
+                  {routine.photos.map((photo) => (
+                    <div key={photo} className={`photo-gallery-thumb ${routine.coverImage === photo ? 'active' : ''}`}>
+                      <img src={photo} alt="" onClick={() => updateUser({ routines: user.routines.map((item) => item.id === routine.id ? { ...item, coverImage: photo } : item) })} />
+                      <button type="button" className="photo-gallery-remove" onClick={() => removeRoutinePhoto(routine.id, photo)} aria-label="Remove photo">
+                        <X size={10} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               <div className="metric-modal-header">
                 <div>
@@ -3866,11 +3928,32 @@ function HabitView({ user, updateUser, setToast }) {
     setToast('Habit logged for today')
   }
 
-  const handleHabitCoverUpload = async (habitId, file) => {
-    const dataUrl = await readFileAsDataUrl(file)
-    if (!dataUrl) return
+  const handleHabitCoverUpload = async (habitId, files) => {
+    const list = Array.from(files || [])
+    if (!list.length) return
+    try {
+      const dataUrls = (await compressImageFiles(list)).filter(Boolean)
+      if (!dataUrls.length) throw new Error('No valid images')
+      updateUser({
+        habits: user.habits.map((habit) => {
+          if (habit.id !== habitId) return habit
+          const photos = [...(habit.photos || []), ...dataUrls]
+          return { ...habit, photos, coverImage: habit.coverImage || dataUrls[0] }
+        }),
+      })
+      setToast(dataUrls.length > 1 ? `${dataUrls.length} photos added` : 'Photo added')
+    } catch {
+      setToast('Could not upload photo. Try a different image.')
+    }
+  }
+
+  const removeHabitPhoto = (habitId, photoUrl) => {
     updateUser({
-      habits: user.habits.map((habit) => (habit.id === habitId ? { ...habit, coverImage: dataUrl } : habit)),
+      habits: user.habits.map((habit) => {
+        if (habit.id !== habitId) return habit
+        const photos = (habit.photos || []).filter((photo) => photo !== photoUrl)
+        return { ...habit, photos, coverImage: habit.coverImage === photoUrl ? (photos[0] || '') : habit.coverImage }
+      }),
     })
   }
 
@@ -4059,8 +4142,20 @@ function HabitView({ user, updateUser, setToast }) {
 
           <label className="habit-cover-uploader">
             {selectedHabit.coverImage ? <img src={selectedHabit.coverImage} alt="" /> : <span>📷 Add a cover photo or icon</span>}
-            <input type="file" accept="image/*" onChange={(event) => handleHabitCoverUpload(selectedHabit.id, event.target.files?.[0])} />
+            <input type="file" accept="image/*" multiple onChange={(event) => { handleHabitCoverUpload(selectedHabit.id, event.target.files); event.target.value = '' }} />
           </label>
+          {selectedHabit.photos?.length > 1 && (
+            <div className="photo-gallery-row">
+              {selectedHabit.photos.map((photo) => (
+                <div key={photo} className={`photo-gallery-thumb ${selectedHabit.coverImage === photo ? 'active' : ''}`}>
+                  <img src={photo} alt="" onClick={() => updateUser({ habits: user.habits.map((item) => item.id === selectedHabit.id ? { ...item, coverImage: photo } : item) })} />
+                  <button type="button" className="photo-gallery-remove" onClick={() => removeHabitPhoto(selectedHabit.id, photo)} aria-label="Remove photo">
+                    <X size={10} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
 
           <div className="habit-stat-row">
             <div><small>MONTHLY %</small><strong>{getCurrentMonthCompletion(selectedHabit)}%</strong></div>
@@ -4754,6 +4849,7 @@ const emptyActivityForm = () => ({
   notes: '',
   coverImage: '',
   coverPreset: 0,
+  photos: [],
 })
 
 function SportsHubView({ user, updateUser, setToast }) {
@@ -4782,25 +4878,38 @@ function SportsHubView({ user, updateUser, setToast }) {
       notes: session.notes || '',
       coverImage: session.coverImage || '',
       coverPreset: session.coverPreset || 0,
+      photos: session.photos || [],
     })
     setModalOpen(true)
   }
 
-  const handleCoverPick = (event) => {
-    const file = event.target.files?.[0]
+  const handleCoverPick = async (event) => {
+    const files = Array.from(event.target.files || [])
     event.target.value = ''
-    if (!file) return
-    if (!file.type.startsWith('image/')) {
-      setToast('Please choose an image file.')
+    if (!files.length) return
+    if (files.some((file) => !file.type.startsWith('image/'))) {
+      setToast('Please choose image files.')
       return
     }
-    if (file.size > 2 * 1024 * 1024) {
-      setToast('Image is too large (max 2MB).')
-      return
+    try {
+      const dataUrls = (await compressImageFiles(files)).filter(Boolean)
+      if (!dataUrls.length) throw new Error('No valid images')
+      setForm((current) => ({
+        ...current,
+        photos: [...(current.photos || []), ...dataUrls],
+        coverImage: current.coverImage || dataUrls[0],
+      }))
+      setToast(dataUrls.length > 1 ? `${dataUrls.length} photos added` : 'Photo added')
+    } catch {
+      setToast('Could not upload photo. Try a different image.')
     }
-    const reader = new FileReader()
-    reader.onload = () => setForm((current) => ({ ...current, coverImage: String(reader.result || '') }))
-    reader.readAsDataURL(file)
+  }
+
+  const removeFormPhoto = (photoUrl) => {
+    setForm((current) => {
+      const photos = (current.photos || []).filter((photo) => photo !== photoUrl)
+      return { ...current, photos, coverImage: current.coverImage === photoUrl ? (photos[0] || '') : current.coverImage }
+    })
   }
 
   const handleSave = () => {
@@ -4828,6 +4937,7 @@ function SportsHubView({ user, updateUser, setToast }) {
       notes: form.notes.trim(),
       coverImage: form.coverImage,
       coverPreset: form.coverPreset,
+      photos: form.photos || [],
       exercises: sessions.find((item) => item.id === form.id)?.exercises || [],
     }
 
@@ -4994,8 +5104,20 @@ function SportsHubView({ user, updateUser, setToast }) {
                   {form.coverImage && (
                     <button type="button" className="ghost-button" onClick={() => setForm({ ...form, coverImage: '' })}>Remove photo</button>
                   )}
-                  <input ref={coverInputRef} type="file" accept="image/*" hidden onChange={handleCoverPick} />
+                  <input ref={coverInputRef} type="file" accept="image/*" multiple hidden onChange={handleCoverPick} />
                 </div>
+                {form.photos?.length > 1 && (
+                  <div className="photo-gallery-row">
+                    {form.photos.map((photo) => (
+                      <div key={photo} className={`photo-gallery-thumb ${form.coverImage === photo ? 'active' : ''}`}>
+                        <img src={photo} alt="" onClick={() => setForm({ ...form, coverImage: photo })} />
+                        <button type="button" className="photo-gallery-remove" onClick={() => removeFormPhoto(photo)} aria-label="Remove photo">
+                          <X size={10} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -5657,7 +5779,7 @@ function SettingsView({ user, updateUser, setToast, onSignOutAll }) {
     setToast('Theme updated')
   }
 
-  const handleAvatarPick = (event) => {
+  const handleAvatarPick = async (event) => {
     const file = event.target.files?.[0]
     event.target.value = ''
     if (!file) return
@@ -5665,16 +5787,14 @@ function SettingsView({ user, updateUser, setToast, onSignOutAll }) {
       setToast('Please choose an image file.')
       return
     }
-    if (file.size > 1.5 * 1024 * 1024) {
-      setToast('Image is too large (max 1.5MB).')
-      return
-    }
-    const reader = new FileReader()
-    reader.onload = () => {
-      updateUser({ avatarUrl: String(reader.result || '') })
+    try {
+      const dataUrl = await compressImageFile(file, 640, 0.85)
+      if (!dataUrl) throw new Error('No image')
+      updateUser({ avatarUrl: dataUrl })
       setToast('Avatar updated')
+    } catch {
+      setToast('Could not upload photo. Try a different image.')
     }
-    reader.readAsDataURL(file)
   }
 
   const toggleMetricVisibility = (metricId) => {
